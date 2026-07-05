@@ -1,0 +1,52 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+Testing/
+CTestTestfile.cmake
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+coverage/
+
+# Sanitizer logs
+*.asan
+*.tsan
+*.msan
+
+# pkg-config generated
+*.pc
+
+# dony state
+.dony-state.json

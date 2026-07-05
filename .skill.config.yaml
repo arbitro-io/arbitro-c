@@ -1,0 +1,14 @@
+project:
+  name: arbitro-c
+  description: Single-file C99 client for the Arbitro message broker
+
+dony:
+  models:
+    worker: sonnet
+    senior: opus-4-6
+    critical: opus-4-8
+    auditor: opus-4-7
+  parallel:
+    S: true
+    M: false
+    L: false

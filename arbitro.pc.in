@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: arbitro
+Description: Single-file C client for the Arbitro message broker
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -larbitro
+Cflags: -I${includedir}

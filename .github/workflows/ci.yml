@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: Build + Unit Tests (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + test (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          make CC=${{ matrix.cc }} clean all test
+
+      - name: Build + test (MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /std:c11 /W4 /WX /Iinclude /c src\arbitro.c /Fo:build\arbitro.obj
+          lib /OUT:build\arbitro.lib build\arbitro.obj
+          cl /std:c11 /W4 /WX /Iinclude tests\unit_tests.c build\arbitro.lib ws2_32.lib /Fe:build\unit_tests.exe
+          build\unit_tests.exe
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      arbitro:
+        image: ghcr.io/arbitro-io/arbitro-server:latest
+        ports:
+          - 9898:9898
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make CC=gcc clean all
+
+      - name: Build integration tests
+        run: make CC=gcc build/integration
+
+      - name: Run integration tests
+        env:
+          ARBITRO_ADDR: "127.0.0.1:9898"
+        run: ./build/integration
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with sanitizers
+        run: |
+          make CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer" clean all test
+
+  valgrind:
+    name: Valgrind
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[valgrind]')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build
+        run: make CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -Werror -g -O0" clean all test
+
+      - name: Valgrind unit tests
+        run: valgrind --leak-check=full --error-exitcode=1 ./build/unit_tests
