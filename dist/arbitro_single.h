@@ -120,6 +120,10 @@ int  arbitro_publish_batch_sync(arbitro_client_t *c, uint32_t stream_id,
 
 int  arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
                        uint32_t consumer_id, arbitro_msg_cb cb, void *userdata);
+int  arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
+                              uint32_t consumer_id,
+                              const uint8_t *filter, uint16_t filter_len,
+                              arbitro_msg_cb cb, void *userdata);
 int  arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id);
 
 int  arbitro_msg_ack(arbitro_msg_t *msg);
@@ -275,7 +279,39 @@ int  arbitro_request_with_id(arbitro_client_t *c, const char *service,
                              uint32_t *out_len);
 
 typedef struct arbitro_service arbitro_service_t;
-typedef void (*arbitro_svc_handler)(arbitro_msg_t *msg, void *userdata);
+
+/**
+ * Incoming service request. Read-only view — the framework manages
+ * ack/nack/reply based on the handler's return value.
+ */
+typedef struct arbitro_request {
+    const uint8_t *subject;
+    uint16_t       subject_len;
+    const uint8_t *payload;
+    uint32_t       payload_len;
+    int            has_reply;    /* non-zero if the requester expects a reply */
+    uint64_t       seq;
+    uint32_t       consumer_id;
+} arbitro_request_t;
+
+/**
+ * Handler for incoming service requests.
+ *
+ * The handler writes any reply payload into `out_buf` (up to `out_cap` bytes)
+ * and sets `*out_len` to the number of bytes written.
+ *
+ * Return value:
+ *   ARBITRO_OK (0)      — framework replies (if `has_reply` and `*out_len > 0`)
+ *                          and acks the delivery.
+ *   negative error code — framework nacks the delivery for redelivery.
+ *
+ * The framework guarantees exactly one ack or nack per invocation. The handler
+ * must not call arbitro_msg_ack/nack/reply — that responsibility now belongs
+ * to the framework.
+ */
+typedef int (*arbitro_svc_handler)(const arbitro_request_t *req,
+                                   uint8_t *out_buf, uint32_t out_cap,
+                                   uint32_t *out_len, void *userdata);
 
 int  arbitro_service_create(arbitro_client_t *c, const char *name,
                             uint32_t max_inflight,
@@ -930,6 +966,8 @@ int arbitro_client_connect(const char *host, uint16_t port,
     return ARBITRO_OK;
 }
 
+static int arb__ack_flush(arbitro_client_t *c);
+
 void arbitro_client_close(arbitro_client_t *c) {
     if (!c) return;
     if (c->default_svc) {
@@ -1091,6 +1129,8 @@ int arbitro_client_poll(arbitro_client_t *c, int timeout_ms) {
         return ARBITRO_ERR_STATE;
 
     rc = arb__flush_wr(c);
+    if (rc != ARBITRO_OK) return rc;
+    rc = arb__ack_flush(c);
     if (rc != ARBITRO_OK) return rc;
 
     if (c->rd_len > c->rd_off) {
@@ -1287,8 +1327,6 @@ static uint32_t arb__publish_body(uint8_t *dst, uint32_t stream_id,
 /* Publish (hot path, zero alloc)                                             */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
-static int arb__ack_flush(arbitro_client_t *c);
-
 static int arb__flush_wr(arbitro_client_t *c) {
     int rc;
     if (c->wr_len == 0) return ARBITRO_OK;
@@ -1411,12 +1449,14 @@ int arbitro_publish_sync_with_id(arbitro_client_t *c, uint32_t stream_id,
 /* Subscribe + Ack                                                            */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
-int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
-                      uint32_t consumer_id, arbitro_msg_cb cb, void *userdata) {
+int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
+                             uint32_t consumer_id,
+                             const uint8_t *filter, uint16_t filter_len,
+                             arbitro_msg_cb cb, void *userdata) {
     int i;
     arb_sub_t *slot = NULL;
     if (!c || !cb) return ARBITRO_ERR_ARG;
-    uint8_t body[256];
+    uint8_t body[1024];
     arb_json_t j;
     size_t blen;
 
@@ -1432,6 +1472,8 @@ int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
     arb__json_u32(&j, 0);
     arb__json_key(&j, "filters");
     arb__json_array_begin(&j);
+    if (filter && filter_len > 0)
+        arb__json_bytes(&j, filter, filter_len);
     arb__json_array_end(&j);
     blen = arb__json_end(&j);
     if (blen == 0) return ARBITRO_ERR_ARG;
@@ -1446,6 +1488,11 @@ int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
     slot->ud = userdata;
     slot->active = 1;
     return ARBITRO_OK;
+}
+
+int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
+                      uint32_t consumer_id, arbitro_msg_cb cb, void *userdata) {
+    return arbitro_subscribe_filter(c, stream_id, consumer_id, NULL, 0, cb, userdata);
 }
 
 int arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id) {
@@ -1635,7 +1682,7 @@ int arbitro_stream_create(arbitro_client_t *c, const char *name,
     arb_pending_t *rep = NULL;
     int rc;
     if (!c || !name || !name[0]) return ARBITRO_ERR_ARG;
-    if (strlen(name) >= 128) return ARBITRO_ERR_ARG;
+    if (strlen(name) >= 64) return ARBITRO_ERR_ARG;
     if (!cfg) return ARBITRO_ERR_ARG;
 
     arb__json_begin(&j, body, sizeof(body));
@@ -1704,7 +1751,7 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
     arb_pending_t *rep = NULL;
     uint32_t stream_id;
     uint32_t i;
-    if (!c || !stream || !stream[0] || strlen(stream) >= 128) return ARBITRO_ERR_ARG;
+    if (!c || !stream || !stream[0] || strlen(stream) >= 64) return ARBITRO_ERR_ARG;
     if (!cfg || !cfg->name) return ARBITRO_ERR_ARG;
     int rc;
 
@@ -2689,7 +2736,34 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
         if (!svc->handlers[i].active) continue;
         if (strlen(svc->handlers[i].method) == method_len &&
             memcmp(svc->handlers[i].method, method_start, method_len) == 0) {
-            svc->handlers[i].handler(msg, svc->handlers[i].userdata);
+            /* Auto-ack pattern: framework builds the request view, invokes
+               the handler with a stack-allocated reply buffer, then replies
+               (if the requester expects one) and acks. Handler-returned
+               errors trigger a nack. */
+            enum { ARB_SVC_REPLY_MAX = 8192 };
+            uint8_t reply_buf[ARB_SVC_REPLY_MAX];
+            uint32_t reply_len = 0;
+            arbitro_request_t req;
+            int rc;
+
+            req.subject     = msg->subject;
+            req.subject_len = msg->subject_len;
+            req.payload     = msg->data;
+            req.payload_len = msg->data_len;
+            req.has_reply   = (msg->reply_len > 0);
+            req.seq         = msg->seq;
+            req.consumer_id = msg->consumer_id;
+
+            rc = svc->handlers[i].handler(&req, reply_buf, ARB_SVC_REPLY_MAX,
+                                          &reply_len, svc->handlers[i].userdata);
+            if (rc < 0) {
+                arbitro_msg_nack(msg);
+            } else {
+                if (req.has_reply && reply_len > 0) {
+                    arbitro_msg_reply(msg, reply_buf, reply_len);
+                }
+                arbitro_msg_ack(msg);
+            }
             return;
         }
     }

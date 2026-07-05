@@ -2396,7 +2396,34 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
         if (!svc->handlers[i].active) continue;
         if (strlen(svc->handlers[i].method) == method_len &&
             memcmp(svc->handlers[i].method, method_start, method_len) == 0) {
-            svc->handlers[i].handler(msg, svc->handlers[i].userdata);
+            /* Auto-ack pattern: framework builds the request view, invokes
+               the handler with a stack-allocated reply buffer, then replies
+               (if the requester expects one) and acks. Handler-returned
+               errors trigger a nack. */
+            enum { ARB_SVC_REPLY_MAX = 8192 };
+            uint8_t reply_buf[ARB_SVC_REPLY_MAX];
+            uint32_t reply_len = 0;
+            arbitro_request_t req;
+            int rc;
+
+            req.subject     = msg->subject;
+            req.subject_len = msg->subject_len;
+            req.payload     = msg->data;
+            req.payload_len = msg->data_len;
+            req.has_reply   = (msg->reply_len > 0);
+            req.seq         = msg->seq;
+            req.consumer_id = msg->consumer_id;
+
+            rc = svc->handlers[i].handler(&req, reply_buf, ARB_SVC_REPLY_MAX,
+                                          &reply_len, svc->handlers[i].userdata);
+            if (rc < 0) {
+                arbitro_msg_nack(msg);
+            } else {
+                if (req.has_reply && reply_len > 0) {
+                    arbitro_msg_reply(msg, reply_buf, reply_len);
+                }
+                arbitro_msg_ack(msg);
+            }
             return;
         }
     }

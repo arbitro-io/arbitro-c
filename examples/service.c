@@ -3,21 +3,22 @@
 #include <string.h>
 #include "arbitro/arbitro.h"
 
-static void on_add(arbitro_msg_t *msg, void *ud) {
+static int on_add(const arbitro_request_t *req,
+                  uint8_t *out_buf, uint32_t out_cap,
+                  uint32_t *out_len, void *ud) {
     int32_t a, b, result;
-    uint8_t out[16];
     (void)ud;
 
-    if (msg->data_len < 8) {
-        arbitro_msg_reply(msg, (const uint8_t *)"err", 3);
-        return;
+    if (req->payload_len < 8 || out_cap < 4) {
+        return ARBITRO_ERR_ARG;
     }
 
-    memcpy(&a, msg->data, 4);
-    memcpy(&b, msg->data + 4, 4);
+    memcpy(&a, req->payload, 4);
+    memcpy(&b, req->payload + 4, 4);
     result = a + b;
-    memcpy(out, &result, 4);
-    arbitro_msg_reply(msg, out, 4);
+    memcpy(out_buf, &result, 4);
+    *out_len = 4;
+    return ARBITRO_OK;
 }
 
 int main(void) {

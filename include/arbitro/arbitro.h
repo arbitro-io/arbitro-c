@@ -271,7 +271,39 @@ int  arbitro_request_with_id(arbitro_client_t *c, const char *service,
                              uint32_t *out_len);
 
 typedef struct arbitro_service arbitro_service_t;
-typedef void (*arbitro_svc_handler)(arbitro_msg_t *msg, void *userdata);
+
+/**
+ * Incoming service request. Read-only view — the framework manages
+ * ack/nack/reply based on the handler's return value.
+ */
+typedef struct arbitro_request {
+    const uint8_t *subject;
+    uint16_t       subject_len;
+    const uint8_t *payload;
+    uint32_t       payload_len;
+    int            has_reply;    /* non-zero if the requester expects a reply */
+    uint64_t       seq;
+    uint32_t       consumer_id;
+} arbitro_request_t;
+
+/**
+ * Handler for incoming service requests.
+ *
+ * The handler writes any reply payload into `out_buf` (up to `out_cap` bytes)
+ * and sets `*out_len` to the number of bytes written.
+ *
+ * Return value:
+ *   ARBITRO_OK (0)      — framework replies (if `has_reply` and `*out_len > 0`)
+ *                          and acks the delivery.
+ *   negative error code — framework nacks the delivery for redelivery.
+ *
+ * The framework guarantees exactly one ack or nack per invocation. The handler
+ * must not call arbitro_msg_ack/nack/reply — that responsibility now belongs
+ * to the framework.
+ */
+typedef int (*arbitro_svc_handler)(const arbitro_request_t *req,
+                                   uint8_t *out_buf, uint32_t out_cap,
+                                   uint32_t *out_len, void *userdata);
 
 int  arbitro_service_create(arbitro_client_t *c, const char *name,
                             uint32_t max_inflight,

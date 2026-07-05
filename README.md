@@ -174,10 +174,18 @@ arbitro_service_handle(svc, "add", on_add, NULL);
 arbitro_client_run(c);
 arbitro_service_destroy(svc);
 
-// Handler replies via arbitro_msg_reply
-void on_add(arbitro_msg_t *msg, void *ud) {
-    int32_t result = compute(msg->data, msg->data_len);
-    arbitro_msg_reply(msg, (const uint8_t *)&result, sizeof(result));
+// Handler writes reply bytes into out_buf and returns ARBITRO_OK.
+// The framework auto-replies (if the requester expects one) and acks.
+// Return a negative error code to nack for redelivery.
+int on_add(const arbitro_request_t *req,
+           uint8_t *out_buf, uint32_t out_cap,
+           uint32_t *out_len, void *ud) {
+    (void)ud;
+    if (out_cap < sizeof(int32_t)) return ARBITRO_ERR_ARG;
+    int32_t result = compute(req->payload, req->payload_len);
+    memcpy(out_buf, &result, sizeof(result));
+    *out_len = sizeof(result);
+    return ARBITRO_OK;
 }
 
 // Client side: send request with timeout
