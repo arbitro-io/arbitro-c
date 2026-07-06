@@ -2116,9 +2116,18 @@ struct arbitro_service {
     arbitro_client_t *client;
     char              name[64];
     uint32_t          stream_id;
-    uint32_t          consumer_id;
+    uint32_t          worker_consumer_id;
+    uint32_t          reply_consumer_id;
+    uint32_t          instance_id;
     arb_handler_t     handlers[ARB_MAX_HANDLERS];
 };
+
+static uint32_t arb__next_svc_instance_id(void) {
+    static uint32_t counter = 0;
+    counter++;
+    if (counter == 0) counter = 1;
+    return counter;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /* Correlated request                                                         */
@@ -2261,7 +2270,7 @@ static int arb__do_request(arbitro_service_t *my_svc,
 
     {
         int n = snprintf((char *)subject, sizeof(subject),
-                         "_svc.%s.%s", target, method);
+                         "_svc.%s.m.%s", target, method);
         if (n < 0 || (size_t)n >= sizeof(subject)) return ARBITRO_ERR_ARG;
         subj_len = (uint32_t)n;
     }
@@ -2272,7 +2281,8 @@ static int arb__do_request(arbitro_service_t *my_svc,
     }
     {
         int n = snprintf((char *)reply_subject, sizeof(reply_subject),
-                         "_svc.%s._r.%s", my_svc->name, corr_str);
+                         "_svc.%s._r.%u.%s", my_svc->name,
+                         (unsigned)my_svc->instance_id, corr_str);
         if (n < 0 || (size_t)n >= sizeof(reply_subject)) return ARBITRO_ERR_ARG;
         reply_subj_len = (uint32_t)n;
     }
@@ -2356,23 +2366,41 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
     uint16_t subj_len = msg->subject_len;
     size_t prefix_len = 5;
     size_t name_len = strlen(svc->name);
-    const uint8_t *method_start;
-    uint16_t method_len;
+    const uint8_t *tail;
+    uint16_t tail_len;
     size_t skip;
 
     skip = prefix_len + name_len + 1;
     if (subj_len <= skip) { arbitro_msg_ack(msg); return; }
-    method_start = subj + skip;
-    method_len = subj_len - (uint16_t)skip;
+    tail = subj + skip;
+    tail_len = subj_len - (uint16_t)skip;
 
-    if (method_len >= 3 && method_start[0] == '_' && method_start[1] == 'r'
-        && method_start[2] == '.') {
-        const uint8_t *corr = method_start + 3;
-        uint16_t corr_len = method_len - 3;
+    /* Reply subject: `_svc.<name>._r.<instance>.<corr>` — instance-scoped
+       so replies never load-balance to sibling instances. */
+    if (tail_len >= 3 && tail[0] == '_' && tail[1] == 'r' && tail[2] == '.') {
+        char inst_str[16];
+        int inst_str_len;
+        const uint8_t *after_r = tail + 3;
+        uint16_t after_r_len = tail_len - 3;
+        const uint8_t *corr;
+        uint16_t corr_len;
         uint64_t corr_id = 0;
         uint16_t k;
-        int valid = (corr_len > 0 && corr_len <= 20);
+        int valid;
         arb_waiter_t *w;
+
+        inst_str_len = snprintf(inst_str, sizeof(inst_str), "%u.",
+                                (unsigned)svc->instance_id);
+        if (inst_str_len <= 0 || after_r_len < (uint16_t)inst_str_len ||
+            memcmp(after_r, inst_str, (size_t)inst_str_len) != 0) {
+            /* Not our instance — the broker filter should prevent this;
+               ack and move on. */
+            arbitro_msg_ack(msg);
+            return;
+        }
+        corr = after_r + inst_str_len;
+        corr_len = after_r_len - (uint16_t)inst_str_len;
+        valid = (corr_len > 0 && corr_len <= 20);
         for (k = 0; valid && k < corr_len; k++) {
             if (corr[k] < '0' || corr[k] > '9') { valid = 0; break; }
             corr_id = corr_id * 10 + (uint64_t)(corr[k] - '0');
@@ -2391,6 +2419,15 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
         arbitro_msg_ack(msg);
         return;
     }
+
+    /* Method call: `_svc.<name>.m.<method>` — strip the `m.` infix. */
+    if (tail_len < 2 || tail[0] != 'm' || tail[1] != '.') {
+        arbitro_msg_ack(msg);
+        return;
+    }
+    {
+    const uint8_t *method_start = tail + 2;
+    uint16_t method_len = tail_len - 2;
 
     for (i = 0; i < ARB_MAX_HANDLERS; i++) {
         if (!svc->handlers[i].active) continue;
@@ -2428,6 +2465,7 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
         }
     }
     arbitro_msg_ack(msg);
+    }
 }
 
 int arbitro_service_create(arbitro_client_t *c, const char *name,
@@ -2437,36 +2475,66 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     arbitro_stream_cfg_t scfg = {0};
     arbitro_consumer_cfg_t ccfg = {0};
     char stream_name[128];
-    char filter[128];
-    char consumer_name[128];
+    char stream_filter[128];
+    char worker_filter[128];
+    char worker_name[128];
+    char reply_filter[160];
+    char reply_name[160];
     int rc;
 
     svc = (arbitro_service_t *)calloc(1, sizeof(arbitro_service_t));
     if (!svc) return ARBITRO_ERR_NOMEM;
 
     svc->client = c;
+    svc->instance_id = arb__next_svc_instance_id();
     snprintf(svc->name, sizeof(svc->name), "%s", name);
 
-    snprintf(stream_name, sizeof(stream_name), "_svc-%s", name);
-    snprintf(filter, sizeof(filter), "_svc.%s.>", name);
-    snprintf(consumer_name, sizeof(consumer_name), "_svc-%s-worker", name);
+    snprintf(stream_name,    sizeof(stream_name),    "_svc-%s", name);
+    snprintf(stream_filter,  sizeof(stream_filter),  "_svc.%s.>", name);
+    snprintf(worker_filter,  sizeof(worker_filter),  "_svc.%s.m.>", name);
+    snprintf(worker_name,    sizeof(worker_name),    "_svc-%s-worker", name);
+    snprintf(reply_filter,   sizeof(reply_filter),   "_svc.%s._r.%u.>",
+             name, (unsigned)svc->instance_id);
+    snprintf(reply_name,     sizeof(reply_name),     "_svc-%s-reply-%u",
+             name, (unsigned)svc->instance_id);
 
-    scfg.subject_filter = filter;
+    scfg.subject_filter = stream_filter;
     scfg.max_age_ms = 3600000;
     rc = arbitro_stream_upsert(c, stream_name, &scfg, &svc->stream_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    ccfg.name = consumer_name;
-    ccfg.filter = filter;
+    /* Worker consumer: queue-grouped, handles method calls only. */
+    ccfg.name = worker_name;
+    ccfg.filter = worker_filter;
+    ccfg.group = worker_name;
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = max_inflight;
     ccfg.ack_wait_ms = 30000;
-    rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->consumer_id);
+    rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->worker_consumer_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    rc = arbitro_subscribe(c, svc->stream_id, svc->consumer_id,
+    /* Reply consumer: per-instance, NO group — replies MUST NOT
+       load-balance to sibling instances. Deliver only new replies. */
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.name = reply_name;
+    ccfg.filter = reply_filter;
+    ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight = max_inflight;
+    ccfg.ack_wait_ms = 30000;
+    ccfg.deliver_policy = 1; /* New */
+    rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->reply_consumer_id);
+    if (rc != ARBITRO_OK) { free(svc); return rc; }
+
+    rc = arbitro_subscribe(c, svc->stream_id, svc->worker_consumer_id,
                            arb__svc_dispatch, svc);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
+    rc = arbitro_subscribe(c, svc->stream_id, svc->reply_consumer_id,
+                           arb__svc_dispatch, svc);
+    if (rc != ARBITRO_OK) {
+        arbitro_unsubscribe(c, svc->worker_consumer_id);
+        free(svc);
+        return rc;
+    }
 
     *out_svc = svc;
     return ARBITRO_OK;
@@ -2490,7 +2558,8 @@ int arbitro_service_handle(arbitro_service_t *svc, const char *method,
 
 void arbitro_service_destroy(arbitro_service_t *svc) {
     if (!svc) return;
-    arbitro_unsubscribe(svc->client, svc->consumer_id);
+    arbitro_unsubscribe(svc->client, svc->worker_consumer_id);
+    arbitro_unsubscribe(svc->client, svc->reply_consumer_id);
     free(svc);
 }
 
