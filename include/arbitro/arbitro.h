@@ -17,6 +17,8 @@ extern "C" {
 #define ARBITRO_MAX_MSG_ID_LEN     64
 #define ARBITRO_DEFAULT_FRAME_BUF  (64 * 1024)
 #define ARBITRO_ACK_BATCH_MAX      256
+#define ARBITRO_NACK_BATCH_MAX     256
+#define ARBITRO_PUBLISH_BATCH_MAX  256
 
 #define ARBITRO_OK             0
 #define ARBITRO_ERR_SOCKET    -1
@@ -78,6 +80,7 @@ int  arbitro_client_run(arbitro_client_t *c);
 void arbitro_client_stop(arbitro_client_t *c);
 int  arbitro_client_flush(arbitro_client_t *c);
 int  arbitro_client_flush_acks(arbitro_client_t *c);
+int  arbitro_client_flush_nacks(arbitro_client_t *c);
 
 int  arbitro_publish(arbitro_client_t *c, uint32_t stream_id,
                      const uint8_t *subject, uint16_t subject_len,
@@ -111,6 +114,8 @@ int  arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
 int  arbitro_publish_batch_sync(arbitro_client_t *c, uint32_t stream_id,
                                 const arbitro_batch_entry_t *entries, size_t count,
                                 uint64_t *out_first_seq);
+int  arbitro_publish_batch_async(arbitro_client_t *c, uint32_t stream_id,
+                                 const arbitro_batch_entry_t *entries, size_t count);
 
 int  arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
                        uint32_t consumer_id, arbitro_msg_cb cb, void *userdata);
@@ -122,6 +127,7 @@ int  arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id);
 
 int  arbitro_msg_ack(arbitro_msg_t *msg);
 int  arbitro_msg_nack(arbitro_msg_t *msg);
+int  arbitro_msg_nack_delay(arbitro_msg_t *msg, uint32_t delay_ms);
 int  arbitro_msg_reply(arbitro_msg_t *msg, const uint8_t *payload,
                        uint32_t payload_len);
 
@@ -170,6 +176,8 @@ int  arbitro_consumer_create(arbitro_client_t *c, const char *stream,
                              uint32_t *out_consumer_id);
 int  arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
                              const char *consumer);
+int  arbitro_get_pending(arbitro_client_t *c, uint32_t consumer_id,
+                         uint64_t *out_pending);
 
 typedef struct {
     uint8_t *buf;
@@ -194,8 +202,13 @@ typedef struct {
     uint64_t batch_frames_recv;
     uint64_t requests_sent;
     uint64_t replies_recv;
+    uint64_t publish_errors;
+    uint64_t last_pong_rtt_ns;  /* 0 = no pong observed yet */
     uint32_t active_subs;
     uint32_t pending_requests;
+    /* acks_deferred/persisted_cold/expired/confirmed, dedup_hits,
+       manage_requests_sent, suspicious_seq_over_high land in Wave4
+       (ackrel) — not tracked yet. */
 } arbitro_metrics_t;
 
 void arbitro_client_metrics(const arbitro_client_t *c, arbitro_metrics_t *out);
@@ -254,10 +267,19 @@ int  arbitro_publish_with_headers(arbitro_client_t *c, uint32_t stream_id,
                                   const uint8_t *subject, uint16_t subject_len,
                                   const arbitro_header_t *headers, size_t header_count,
                                   const uint8_t *payload, uint32_t payload_len);
+int  arbitro_publish_with_headers_sync(arbitro_client_t *c, uint32_t stream_id,
+                                       const uint8_t *subject, uint16_t subject_len,
+                                       const arbitro_header_t *headers, size_t header_count,
+                                       const uint8_t *payload, uint32_t payload_len,
+                                       uint64_t *out_seq);
 int  arbitro_publish_delayed(arbitro_client_t *c, uint32_t stream_id,
                              const uint8_t *subject, uint16_t subject_len,
                              const uint8_t *payload, uint32_t payload_len,
                              uint64_t delay_ms);
+int  arbitro_publish_delayed_sync(arbitro_client_t *c, uint32_t stream_id,
+                                  const uint8_t *subject, uint16_t subject_len,
+                                  const uint8_t *payload, uint32_t payload_len,
+                                  uint64_t delay_ms, uint64_t *out_seq);
 
 int  arbitro_request(arbitro_client_t *c, const char *service,
                      const char *method,

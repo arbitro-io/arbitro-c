@@ -238,6 +238,61 @@ ARB_TEST(test_metrics) {
     ARB_PASS();
 }
 
+static int pending_delivered = 0;
+static void pending_cb(arbitro_msg_t *msg, void *ud) {
+    (void)msg;
+    (void)ud;
+    pending_delivered++;
+}
+
+ARB_TEST(test_get_pending) {
+    arbitro_client_t *c;
+    uint32_t stream_id, consumer_id;
+    arbitro_stream_cfg_t scfg = {0};
+    arbitro_consumer_cfg_t ccfg = {0};
+    uint64_t pending = 0;
+    int rc;
+
+    rc = try_connect(&c);
+    if (rc == ARBITRO_ERR_CONNECT) {
+        fprintf(stderr, "  SKIP %s (broker unreachable)\n", arb__test_current);
+        arb__test_pass++;
+        return;
+    }
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+
+    scfg.subject_filter = "integ-pending.>";
+    rc = arbitro_stream_upsert(c, "integ-pending", &scfg, &stream_id);
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+
+    ccfg.name = "integ-pending-worker";
+    ccfg.filter = "integ-pending.>";
+    ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight = 100;
+    rc = arbitro_consumer_upsert(c, "integ-pending", &ccfg, &consumer_id);
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+
+    rc = arbitro_subscribe(c, stream_id, consumer_id, pending_cb, NULL);
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+
+    pending_delivered = 0;
+    rc = arbitro_publish_sync(c, stream_id,
+                              (const uint8_t *)"integ-pending.a", 15,
+                              (const uint8_t *)"x", 1, NULL);
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+
+    rc = arbitro_client_poll(c, 2000);
+    ARB_ASSERT(rc == ARBITRO_OK || rc == ARBITRO_ERR_TIMEOUT);
+    ARB_ASSERT_EQ(pending_delivered, 1);
+
+    rc = arbitro_get_pending(c, consumer_id, &pending);
+    ARB_ASSERT_EQ(rc, ARBITRO_OK);
+    ARB_ASSERT(pending >= 1);
+
+    arbitro_client_close(c);
+    ARB_PASS();
+}
+
 int main(void) {
     fprintf(stdout, "arbitro-c integration tests\n");
     fprintf(stdout, "broker: %s:%u\n\n", get_addr(), (unsigned)get_port());

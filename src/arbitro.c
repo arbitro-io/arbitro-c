@@ -65,6 +65,7 @@
 #define ARB_ACT_REP_BATCH       0x0205
 #define ARB_ACT_BATCH_ACK       0x0206
 #define ARB_ACT_FANOUT_BATCH    0x0207
+#define ARB_ACT_BATCH_NACK      0x020A
 
 #define ARB_ACT_SUBSCRIBE       0x0301
 #define ARB_ACT_UNSUBSCRIBE     0x0302
@@ -79,6 +80,7 @@
 #define ARB_ACT_DELETE_CONSUMER 0x0502
 #define ARB_ACT_CONSUMER_INFO   0x0503
 #define ARB_ACT_LIST_CONSUMERS  0x0504
+#define ARB_ACT_CONSUMER_STATS  0x0505
 
 #define ARB_FLAG_ACK_REQ        0x01
 #define ARB_ENTRY_HAS_HEADERS   0x10
@@ -133,6 +135,16 @@ static uint64_t arb__now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+ARB__UNUSED static uint64_t arb__now_ns(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64() * 1000000ULL; /* ms resolution on Windows */
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
 }
 
@@ -440,6 +452,7 @@ struct arbitro_client {
     uint32_t     keepalive_interval_ms;
     uint32_t     keepalive_timeout_ms;
     uint64_t     last_ping_sent_ms;
+    uint64_t     last_ping_sent_ns;
     uint64_t     last_pong_ms;
 
     size_t       rd_len;
@@ -447,6 +460,8 @@ struct arbitro_client {
 
     uint32_t     ack_count;
     uint32_t     ack_consumer_id;
+    uint32_t     nack_count;
+    uint32_t     nack_consumer_id;
 
     arb_sub_t    subs[ARB_MAX_SUBS];
     arb_pending_t pending[ARB_MAX_PENDING];
@@ -462,11 +477,14 @@ struct arbitro_client {
     uint64_t     m_batch_frames_recv;
     uint64_t     m_requests_sent;
     uint64_t     m_replies_recv;
+    uint64_t     m_publish_errors;
+    uint64_t     m_last_pong_rtt_ns;
 
     size_t       wr_len;
 
     uint8_t     *rd_buf;
     uint8_t     *ack_buf;
+    uint8_t     *nack_buf;
     uint8_t     *wr_buf;
 
     arbitro_service_t *default_svc;
@@ -475,6 +493,7 @@ struct arbitro_client {
 };
 
 #define ARB_ACK_BUF_SIZE (8 + ARBITRO_ACK_BATCH_MAX * 16)
+#define ARB_NACK_BUF_SIZE (8 + ARBITRO_NACK_BATCH_MAX * 16)
 
 /* ���══════════���═══════════════════════════════════════════════════════════════ */
 /* Hello handshake                                                            */
@@ -597,15 +616,17 @@ int arbitro_client_connect(const char *host, uint16_t port,
     alloc_size = sizeof(arbitro_client_t)
                + opts->frame_buf_size      /* rd_buf */
                + ARB_ACK_BUF_SIZE          /* ack_buf */
+               + ARB_NACK_BUF_SIZE         /* nack_buf */
                + opts->frame_buf_size;     /* wr_buf */
 
     c = (arbitro_client_t *)calloc(1, alloc_size);
     if (!c) return ARBITRO_ERR_NOMEM;
 
     base = (uint8_t *)c + sizeof(arbitro_client_t);
-    c->rd_buf  = base;
-    c->ack_buf = base + opts->frame_buf_size;
-    c->wr_buf  = base + opts->frame_buf_size + ARB_ACK_BUF_SIZE;
+    c->rd_buf   = base;
+    c->ack_buf  = base + opts->frame_buf_size;
+    c->nack_buf = base + opts->frame_buf_size + ARB_ACK_BUF_SIZE;
+    c->wr_buf   = base + opts->frame_buf_size + ARB_ACK_BUF_SIZE + ARB_NACK_BUF_SIZE;
 
     snprintf(c->host, sizeof(c->host), "%s", host);
     c->port               = port;
@@ -641,6 +662,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
 }
 
 static int arb__ack_flush(arbitro_client_t *c);
+static int arb__nack_flush(arbitro_client_t *c);
 
 void arbitro_client_close(arbitro_client_t *c) {
     if (!c) return;
@@ -727,9 +749,13 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
         return arb__net_send_all(c->sock, pong, ARB_HDR_LEN);
     }
 
-    case ARB_ACT_PONG:
+    case ARB_ACT_PONG: {
+        uint64_t now_ns = arb__now_ns();
         c->last_pong_ms = arb__now_ms();
+        if (c->last_ping_sent_ns > 0 && now_ns > c->last_ping_sent_ns)
+            c->m_last_pong_rtt_ns = now_ns - c->last_ping_sent_ns;
         return ARBITRO_OK;
+    }
 
     case ARB_ACT_REP_OK: {
         arb_pending_t *p = arb__pending_find(c, fr->seq);
@@ -796,6 +822,7 @@ int arbitro_client_ping(arbitro_client_t *c) {
     if (!c || !c->connected) return ARBITRO_ERR_STATE;
     arb__hdr_write(hdr, ARB_ACT_PING, 0, 0, 0, 0);
     c->last_ping_sent_ms = arb__now_ms();
+    c->last_ping_sent_ns = arb__now_ns();
     return arb__net_send_all(c->sock, hdr, ARB_HDR_LEN);
 }
 
@@ -847,6 +874,8 @@ int arbitro_client_poll(arbitro_client_t *c, int timeout_ms) {
     rc = arb__flush_wr(c);
     if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
     rc = arb__ack_flush(c);
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+    rc = arb__nack_flush(c);
     if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
     rc = arb__keepalive_tick(c);
     if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
@@ -1066,7 +1095,9 @@ int arbitro_client_flush(arbitro_client_t *c) {
     if (!c || !c->connected) return ARBITRO_ERR_STATE;
     rc = arb__flush_wr(c);
     if (rc != ARBITRO_OK) return rc;
-    return arb__ack_flush(c);
+    rc = arb__ack_flush(c);
+    if (rc != ARBITRO_OK) return rc;
+    return arb__nack_flush(c);
 }
 
 int arbitro_publish(arbitro_client_t *c, uint32_t stream_id,
@@ -1115,6 +1146,7 @@ int arbitro_publish_sync(arbitro_client_t *c, uint32_t stream_id,
     rc = arb__request_ok(c, ARB_ACT_PUBLISH, body, body_len, &rep);
     if (rc == ARBITRO_OK && rep && out_seq)
         *out_seq = rep->rep_u64;
+    if (rc == ARBITRO_ERR_BROKER) c->m_publish_errors++;
     if (rep) arb__pending_release(rep);
 
     c->m_publishes_sent++;
@@ -1164,6 +1196,7 @@ int arbitro_publish_sync_with_id(arbitro_client_t *c, uint32_t stream_id,
                                  msg_id, msg_id_len, payload, payload_len);
     rc = arb__request_ok(c, ARB_ACT_PUBLISH, body, body_len, &rep);
     if (rc == ARBITRO_OK && rep && out_seq) *out_seq = rep->rep_u64;
+    if (rc == ARBITRO_ERR_BROKER) c->m_publish_errors++;
     if (rep) arb__pending_release(rep);
     c->m_publishes_sent++;
     return rc;
@@ -1317,6 +1350,55 @@ int arbitro_client_flush_acks(arbitro_client_t *c) {
     return arb__ack_flush(c);
 }
 
+static int arb__nack_flush(arbitro_client_t *c) {
+    uint8_t hdr[ARB_HDR_LEN];
+    uint32_t body_len;
+    uint32_t flushed;
+    int rc;
+
+    if (c->nack_count == 0) return ARBITRO_OK;
+
+    arb__put_u32(c->nack_buf + 0, c->nack_consumer_id);
+    arb__put_u32(c->nack_buf + 4, c->nack_count);
+    body_len = 8 + c->nack_count * 16;
+    flushed = c->nack_count;
+
+    arb__hdr_write(hdr, ARB_ACT_BATCH_NACK, 0, 0, body_len, c->next_seq++);
+
+    rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->nack_buf, body_len);
+    if (rc != ARBITRO_OK) return rc;
+
+    c->m_nacks_sent += flushed;
+    c->nack_count = 0;
+    return ARBITRO_OK;
+}
+
+int arbitro_msg_nack_delay(arbitro_msg_t *msg, uint32_t delay_ms) {
+    arbitro_client_t *c = msg->client;
+    uint8_t *slot;
+
+    if (c->nack_count > 0 && c->nack_consumer_id != msg->consumer_id) {
+        int rc = arb__nack_flush(c);
+        if (rc != ARBITRO_OK) return rc;
+    }
+
+    c->nack_consumer_id = msg->consumer_id;
+    slot = c->nack_buf + 8 + c->nack_count * 16;
+    arb__put_u64(slot + 0, msg->seq);
+    arb__put_u32(slot + 8, msg->subject_hash);
+    arb__put_u32(slot + 12, delay_ms);
+    c->nack_count++;
+
+    if (c->nack_count >= ARBITRO_NACK_BATCH_MAX)
+        return arb__nack_flush(c);
+
+    return ARBITRO_OK;
+}
+
+int arbitro_client_flush_nacks(arbitro_client_t *c) {
+    return arb__nack_flush(c);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /* Deliver dispatch (hot path, zero copy)                                     */
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -1437,6 +1519,12 @@ int arbitro_client_run(arbitro_client_t *c) {
             continue;
         }
         rc = arb__ack_flush(c);
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+            continue;
+        }
+        rc = arb__nack_flush(c);
         if (rc != ARBITRO_OK) {
             rc = arb__handle_conn_err(c, rc);
             if (rc != ARBITRO_OK) return rc;
@@ -1634,6 +1722,29 @@ int arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
     return arb__request_ok(c, ARB_ACT_DELETE_CONSUMER, body, (uint32_t)blen, NULL);
 }
 
+int arbitro_get_pending(arbitro_client_t *c, uint32_t consumer_id,
+                        uint64_t *out_pending) {
+    uint8_t body[64];
+    arb_json_t j;
+    size_t blen;
+    arb_pending_t *rep = NULL;
+    int rc;
+
+    if (!c || !out_pending) return ARBITRO_ERR_ARG;
+
+    arb__json_begin(&j, body, sizeof(body));
+    arb__json_key(&j, "consumer_id");
+    arb__json_u32(&j, consumer_id);
+    blen = arb__json_end(&j);
+    if (blen == 0) return ARBITRO_ERR_ARG;
+
+    rc = arb__request_ok(c, ARB_ACT_CONSUMER_STATS, body, (uint32_t)blen, &rep);
+    if (rc == ARBITRO_OK && rep && rep->rep_len >= 8)
+        *out_pending = rep->rep_u64;
+    if (rep) arb__pending_release(rep);
+    return rc;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /* Purge / Drain / DeleteMessage                                              */
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -1787,6 +1898,8 @@ void arbitro_client_metrics(const arbitro_client_t *c, arbitro_metrics_t *out) {
     out->batch_frames_recv = c->m_batch_frames_recv;
     out->requests_sent     = c->m_requests_sent;
     out->replies_recv      = c->m_replies_recv;
+    out->publish_errors    = c->m_publish_errors;
+    out->last_pong_rtt_ns  = c->m_last_pong_rtt_ns;
 
     for (i = 0; i < ARB_MAX_SUBS; i++)
         if (c->subs[i].active) subs++;
@@ -1820,19 +1933,12 @@ void arbitro_client_stats(const arbitro_client_t *c, arbitro_stats_t *out) {
 /* Batch publish                                                              */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
-int arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
-                          const arbitro_batch_entry_t *entries, size_t count,
-                          uint64_t *out_first_seq) {
-    uint8_t *buf;
+static int arb__build_batch_body(arbitro_client_t *c, uint32_t stream_id,
+                                 const arbitro_batch_entry_t *entries, size_t count,
+                                 uint32_t *out_body_len) {
+    uint8_t *buf = c->wr_buf;
     uint32_t off = ARB_HDR_LEN;
     size_t i;
-    arb_pending_t *rep = NULL;
-    int rc;
-    uint64_t seq;
-
-    rc = arb__flush_wr(c);
-    if (rc != ARBITRO_OK) return rc;
-    buf = c->wr_buf;
 
     arb__put_u32(buf + off, stream_id);
     arb__put_u32(buf + off + 4, (uint32_t)count);
@@ -1857,15 +1963,43 @@ int arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
         off += entry_len;
     }
 
-    seq = c->next_seq++;
-    arb__hdr_write(buf, ARB_ACT_PUBLISH_BATCH, ARB_FLAG_ACK_REQ, 0,
-                   off - ARB_HDR_LEN, seq);
+    *out_body_len = off - ARB_HDR_LEN;
+    return ARBITRO_OK;
+}
 
-    {
-        arb_pending_t *p = arb__pending_alloc(c, seq);
+/* Chunks at ARBITRO_PUBLISH_BATCH_MAX entries. Only the first chunk's
+   RepOk (first_seq) is meaningful to the caller, mirroring the Rust
+   client's publish_batch_sync_async semantics. */
+int arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
+                          const arbitro_batch_entry_t *entries, size_t count,
+                          uint64_t *out_first_seq) {
+    size_t done = 0;
+    int rc;
+    int have_first_seq = 0;
+
+    if (!c) return ARBITRO_ERR_ARG;
+    rc = arb__flush_wr(c);
+    if (rc != ARBITRO_OK) return rc;
+
+    do {
+        size_t chunk = count - done;
+        uint32_t body_len;
+        uint64_t seq;
+        arb_pending_t *p;
+
+        if (chunk > ARBITRO_PUBLISH_BATCH_MAX) chunk = ARBITRO_PUBLISH_BATCH_MAX;
+
+        rc = arb__build_batch_body(c, stream_id, entries + done, chunk, &body_len);
+        if (rc != ARBITRO_OK) return rc;
+
+        seq = c->next_seq++;
+        arb__hdr_write(c->wr_buf, ARB_ACT_PUBLISH_BATCH, ARB_FLAG_ACK_REQ, 0,
+                       body_len, seq);
+
+        p = arb__pending_alloc(c, seq);
         if (!p) return ARBITRO_ERR_NOMEM;
 
-        rc = arb__net_send_all(c->sock, buf, off);
+        rc = arb__net_send_all(c->sock, c->wr_buf, ARB_HDR_LEN + body_len);
         if (rc != ARBITRO_OK) { arb__pending_release(p); return rc; }
 
         {
@@ -1886,22 +2020,59 @@ int arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
 
         if (!p->done) { arb__pending_release(p); return ARBITRO_ERR_TIMEOUT; }
         rc = p->err_code;
-        rep = p;
-    }
+        if (rc == ARBITRO_OK && !have_first_seq && out_first_seq) {
+            *out_first_seq = p->rep_u64;
+            have_first_seq = 1;
+        }
+        if (rc == ARBITRO_ERR_BROKER) c->m_publish_errors++;
+        arb__pending_release(p);
+        if (rc != ARBITRO_OK) return rc;
 
-    if (rc == ARBITRO_OK && rep && out_first_seq)
-        *out_first_seq = rep->rep_u64;
-    if (rep) arb__pending_release(rep);
+        c->m_publishes_sent++;
+        c->m_batch_entries_sent += (uint64_t)chunk;
+        done += chunk;
+    } while (done < count);
 
-    c->m_publishes_sent++;
-    c->m_batch_entries_sent += (uint64_t)count;
-    return rc;
+    return ARBITRO_OK;
 }
 
 int arbitro_publish_batch_sync(arbitro_client_t *c, uint32_t stream_id,
                                const arbitro_batch_entry_t *entries, size_t count,
                                uint64_t *out_first_seq) {
     return arbitro_publish_batch(c, stream_id, entries, count, out_first_seq);
+}
+
+/* Fire-and-forget: no pending slot, no ACK_REQ, no wait on any chunk. */
+int arbitro_publish_batch_async(arbitro_client_t *c, uint32_t stream_id,
+                                const arbitro_batch_entry_t *entries, size_t count) {
+    size_t done = 0;
+    int rc;
+
+    if (!c) return ARBITRO_ERR_ARG;
+    rc = arb__flush_wr(c);
+    if (rc != ARBITRO_OK) return rc;
+
+    do {
+        size_t chunk = count - done;
+        uint32_t body_len;
+        uint64_t seq;
+
+        if (chunk > ARBITRO_PUBLISH_BATCH_MAX) chunk = ARBITRO_PUBLISH_BATCH_MAX;
+
+        rc = arb__build_batch_body(c, stream_id, entries + done, chunk, &body_len);
+        if (rc != ARBITRO_OK) return rc;
+
+        seq = c->next_seq++;
+        arb__hdr_write(c->wr_buf, ARB_ACT_PUBLISH_BATCH, 0, 0, body_len, seq);
+        rc = arb__net_send_all(c->sock, c->wr_buf, ARB_HDR_LEN + body_len);
+        if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+
+        c->m_publishes_sent++;
+        c->m_batch_entries_sent += (uint64_t)chunk;
+        done += chunk;
+    } while (done < count);
+
+    return ARBITRO_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -2178,25 +2349,38 @@ static uint32_t arb__headers_encode(uint8_t *dst, const arbitro_header_t *hdrs,
     return off;
 }
 
-int arbitro_publish_with_headers(arbitro_client_t *c, uint32_t stream_id,
-                                 const uint8_t *subject, uint16_t subject_len,
-                                 const arbitro_header_t *headers,
-                                 size_t header_count,
-                                 const uint8_t *payload,
-                                 uint32_t payload_len) {
-    uint8_t *buf;
-    uint32_t pub_body_len, ext_off, hdr_len, total_body;
-    int flush_rc = arb__flush_wr(c);
-    if (flush_rc != ARBITRO_OK) return flush_rc;
-    buf = c->wr_buf;
+/* Scans headers for the reserved "msg-id" key and, if present, also
+   writes its value into the PubFrame's dedicated msg_id field (offset
+   6) so broker-side idempotency dedup works even for header-carrying
+   publishes — matches Rust's encode_pub_frame_with_headers. */
+static uint32_t arb__encode_pub_with_headers_body(uint8_t *buf, uint32_t stream_id,
+                                                  const uint8_t *subject, uint16_t subject_len,
+                                                  const arbitro_header_t *headers,
+                                                  size_t header_count,
+                                                  const uint8_t *payload,
+                                                  uint32_t payload_len) {
+    uint32_t pub_body_len, ext_off, hdr_len;
+    uint16_t msg_id_len = 0;
+    const uint8_t *msg_id = NULL;
+    size_t i;
 
-    pub_body_len = 8 + (uint32_t)subject_len;
+    for (i = 0; i < header_count; i++) {
+        if (headers[i].key_len == 6 && memcmp(headers[i].key, "msg-id", 6) == 0) {
+            msg_id = headers[i].val;
+            msg_id_len = (uint16_t)headers[i].val_len;
+            break;
+        }
+    }
+
+    pub_body_len = 8 + (uint32_t)subject_len + (uint32_t)msg_id_len;
     ext_off = ARB_HDR_LEN + pub_body_len;
 
     arb__put_u32(buf + ARB_HDR_LEN, stream_id);
     arb__put_u16(buf + ARB_HDR_LEN + 4, subject_len);
-    arb__put_u16(buf + ARB_HDR_LEN + 6, 0);
+    arb__put_u16(buf + ARB_HDR_LEN + 6, msg_id_len);
     memcpy(buf + ARB_HDR_LEN + 8, subject, subject_len);
+    if (msg_id_len > 0)
+        memcpy(buf + ARB_HDR_LEN + 8 + subject_len, msg_id, msg_id_len);
 
     arb__put_u32(buf + ext_off, payload_len);
     ext_off += 4;
@@ -2208,15 +2392,90 @@ int arbitro_publish_with_headers(arbitro_client_t *c, uint32_t stream_id,
     hdr_len = arb__headers_encode(buf + ext_off, headers, header_count);
     ext_off += hdr_len;
 
-    total_body = ext_off - ARB_HDR_LEN;
+    return ext_off;
+}
+
+int arbitro_publish_with_headers(arbitro_client_t *c, uint32_t stream_id,
+                                 const uint8_t *subject, uint16_t subject_len,
+                                 const arbitro_header_t *headers,
+                                 size_t header_count,
+                                 const uint8_t *payload,
+                                 uint32_t payload_len) {
+    uint8_t *buf;
+    uint32_t ext_off, total_body;
+    int flush_rc = arb__flush_wr(c);
+    if (flush_rc != ARBITRO_OK) return flush_rc;
+    buf = c->wr_buf;
+
+    ext_off = arb__encode_pub_with_headers_body(buf, stream_id, subject, subject_len,
+                                                headers, header_count,
+                                                payload, payload_len);
     if (ext_off > c->frame_buf_size)
         return ARBITRO_ERR_TOOLARGE;
+    total_body = ext_off - ARB_HDR_LEN;
 
     arb__hdr_write(buf, ARB_ACT_PUBLISH, 0, ARB_ENTRY_HAS_HEADERS,
                    total_body, c->next_seq++);
 
     c->m_publishes_sent++;
     return arb__net_send_all(c->sock, buf, ext_off);
+}
+
+int arbitro_publish_with_headers_sync(arbitro_client_t *c, uint32_t stream_id,
+                                      const uint8_t *subject, uint16_t subject_len,
+                                      const arbitro_header_t *headers,
+                                      size_t header_count,
+                                      const uint8_t *payload,
+                                      uint32_t payload_len,
+                                      uint64_t *out_seq) {
+    uint8_t *buf;
+    uint32_t ext_off, total_body;
+    uint64_t seq;
+    arb_pending_t *p;
+    int rc = arb__flush_wr(c);
+    if (rc != ARBITRO_OK) return rc;
+    buf = c->wr_buf;
+
+    ext_off = arb__encode_pub_with_headers_body(buf, stream_id, subject, subject_len,
+                                                headers, header_count,
+                                                payload, payload_len);
+    if (ext_off > c->frame_buf_size)
+        return ARBITRO_ERR_TOOLARGE;
+    total_body = ext_off - ARB_HDR_LEN;
+
+    seq = c->next_seq++;
+    arb__hdr_write(buf, ARB_ACT_PUBLISH, ARB_FLAG_ACK_REQ, ARB_ENTRY_HAS_HEADERS,
+                   total_body, seq);
+
+    p = arb__pending_alloc(c, seq);
+    if (!p) return ARBITRO_ERR_NOMEM;
+
+    rc = arb__net_send_all(c->sock, buf, ext_off);
+    if (rc != ARBITRO_OK) { arb__pending_release(p); return arb__handle_conn_err(c, rc); }
+
+    {
+        uint64_t t0 = arb__now_ms(), now;
+        while (!p->done) {
+            uint32_t remaining;
+            now = arb__now_ms();
+            if (now - t0 >= c->request_timeout_ms) break;
+            remaining = (uint32_t)(c->request_timeout_ms - (now - t0));
+            if (remaining > 100) remaining = 100;
+            rc = arbitro_client_poll(c, (int)remaining);
+            if (rc != ARBITRO_OK && rc != ARBITRO_ERR_TIMEOUT) {
+                arb__pending_release(p);
+                return rc;
+            }
+        }
+    }
+    if (!p->done) { arb__pending_release(p); return ARBITRO_ERR_TIMEOUT; }
+
+    rc = p->err_code;
+    if (rc == ARBITRO_OK && out_seq) *out_seq = p->rep_u64;
+    if (rc == ARBITRO_ERR_BROKER) c->m_publish_errors++;
+    arb__pending_release(p);
+    c->m_publishes_sent++;
+    return rc;
 }
 
 int arbitro_publish_delayed(arbitro_client_t *c, uint32_t stream_id,
@@ -2244,6 +2503,63 @@ int arbitro_publish_delayed(arbitro_client_t *c, uint32_t stream_id,
 
     c->m_publishes_sent++;
     return arb__net_send_all(c->sock, buf, ARB_HDR_LEN + body_len);
+}
+
+int arbitro_publish_delayed_sync(arbitro_client_t *c, uint32_t stream_id,
+                                 const uint8_t *subject, uint16_t subject_len,
+                                 const uint8_t *payload, uint32_t payload_len,
+                                 uint64_t delay_ms, uint64_t *out_seq) {
+    uint8_t *buf;
+    uint32_t body_len;
+    uint64_t seq;
+    arb_pending_t *p;
+    int rc = arb__flush_wr(c);
+    if (rc != ARBITRO_OK) return rc;
+
+    body_len = 16 + (uint32_t)subject_len + payload_len;
+    if (ARB_HDR_LEN + body_len > c->frame_buf_size)
+        return ARBITRO_ERR_TOOLARGE;
+
+    buf = c->wr_buf;
+    seq = c->next_seq++;
+    arb__hdr_write(buf, ARB_ACT_PUBLISH_DELAYED, ARB_FLAG_ACK_REQ, 0, body_len, seq);
+    arb__put_u32(buf + ARB_HDR_LEN, stream_id);
+    arb__put_u16(buf + ARB_HDR_LEN + 4, subject_len);
+    arb__put_u16(buf + ARB_HDR_LEN + 6, 0);
+    arb__put_u64(buf + ARB_HDR_LEN + 8, delay_ms);
+    memcpy(buf + ARB_HDR_LEN + 16, subject, subject_len);
+    if (payload_len > 0)
+        memcpy(buf + ARB_HDR_LEN + 16 + subject_len, payload, payload_len);
+
+    p = arb__pending_alloc(c, seq);
+    if (!p) return ARBITRO_ERR_NOMEM;
+
+    rc = arb__net_send_all(c->sock, buf, ARB_HDR_LEN + body_len);
+    if (rc != ARBITRO_OK) { arb__pending_release(p); return arb__handle_conn_err(c, rc); }
+
+    {
+        uint64_t t0 = arb__now_ms(), now;
+        while (!p->done) {
+            uint32_t remaining;
+            now = arb__now_ms();
+            if (now - t0 >= c->request_timeout_ms) break;
+            remaining = (uint32_t)(c->request_timeout_ms - (now - t0));
+            if (remaining > 100) remaining = 100;
+            rc = arbitro_client_poll(c, (int)remaining);
+            if (rc != ARBITRO_OK && rc != ARBITRO_ERR_TIMEOUT) {
+                arb__pending_release(p);
+                return rc;
+            }
+        }
+    }
+    if (!p->done) { arb__pending_release(p); return ARBITRO_ERR_TIMEOUT; }
+
+    rc = p->err_code;
+    if (rc == ARBITRO_OK && out_seq) *out_seq = p->rep_u64;
+    if (rc == ARBITRO_ERR_BROKER) c->m_publish_errors++;
+    arb__pending_release(p);
+    c->m_publishes_sent++;
+    return rc;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
