@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200112L
+#  endif
+#endif
+
 #include "test_harness.h"
 #include "arbitro/arbitro.h"
 #include <stdint.h>

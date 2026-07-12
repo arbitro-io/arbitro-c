@@ -189,6 +189,11 @@ void arbitro_opts_init(arbitro_opts_t *opts) {
     opts->reconnect_delay_ms    = 500;
     opts->keepalive_interval_ms = 30000;
     opts->keepalive_timeout_ms  = 60000;
+
+    opts->tls_enabled     = 0;
+    opts->tls_server_name = NULL;
+    opts->tls_verify      = 1;
+    opts->tls_ca_file     = NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -518,6 +523,12 @@ struct arbitro_client {
     arb_ackrel_t *ackrel;
     uint64_t     last_ackrel_sweep_ms;
 
+    int          tls_enabled;
+    int          tls_verify;
+    char         tls_server_name[256];
+    char         tls_ca_file[256];
+    void        *tls_ssl;
+
     arbitro_service_t *default_svc;
     int          default_svc_last_err;
     uint64_t     default_svc_fail_until_ms;
@@ -526,7 +537,47 @@ struct arbitro_client {
 #define ARB_ACK_BUF_SIZE (8 + ARBITRO_ACK_BATCH_MAX * 16)
 #define ARB_NACK_BUF_SIZE (8 + ARBITRO_NACK_BATCH_MAX * 16)
 
-/* ���══════════���═══════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* I/O shim — dispatches to TLS (SSL_read/write) when tls_ssl is set,         */
+/* otherwise the raw socket path. Every send/recv/writev2 call site in this  */
+/* file goes through here so TLS is a drop-in under #ifdef ARBITRO_TLS.      */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef ARBITRO_TLS
+static int arb__tls_send_all(arbitro_client_t *c, const uint8_t *buf, size_t len);
+static int arb__tls_recv(arbitro_client_t *c, uint8_t *buf, size_t cap, size_t *out_n);
+static int arb__tls_connect(arbitro_client_t *c, const char *host);
+static void arb__tls_close(arbitro_client_t *c);
+#endif
+
+ARB__UNUSED static int arb__io_send_all(arbitro_client_t *c, const uint8_t *buf, size_t len) {
+#ifdef ARBITRO_TLS
+    if (c->tls_ssl) return arb__tls_send_all(c, buf, len);
+#endif
+    return arb__net_send_all(c->sock, buf, len);
+}
+
+ARB__UNUSED static int arb__io_recv(arbitro_client_t *c, uint8_t *buf, size_t cap, size_t *out_n) {
+#ifdef ARBITRO_TLS
+    if (c->tls_ssl) return arb__tls_recv(c, buf, cap, out_n);
+#endif
+    return arb__net_recv(c->sock, buf, cap, out_n);
+}
+
+ARB__UNUSED static int arb__io_writev2(arbitro_client_t *c,
+                                       const uint8_t *a, size_t alen,
+                                       const uint8_t *b, size_t blen) {
+#ifdef ARBITRO_TLS
+    if (c->tls_ssl) {
+        int rc = arb__tls_send_all(c, a, alen);
+        if (rc != ARBITRO_OK) return rc;
+        return arb__tls_send_all(c, b, blen);
+    }
+#endif
+    return arb__net_writev2(c->sock, a, alen, b, blen);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
 /* Hello handshake                                                            */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -537,7 +588,7 @@ ARB__UNUSED static int arb__send_hello(arbitro_client_t *c) {
     hello[5] = 0;
     hello[6] = 0;
     hello[7] = 0;
-    return arb__net_send_all(c->sock, hello, 8);
+    return arb__io_send_all(c, hello, 8);
 }
 
 /* ═════════════════════════════════════════════════════════��═════════════════ */
@@ -672,6 +723,13 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->next_seq           = 1;
     c->sock               = ARB_SOCK_INVALID;
 
+    c->tls_enabled = opts->tls_enabled;
+    c->tls_verify  = opts->tls_verify;
+    snprintf(c->tls_server_name, sizeof(c->tls_server_name), "%s",
+             opts->tls_server_name ? opts->tls_server_name : host);
+    if (opts->tls_ca_file)
+        snprintf(c->tls_ca_file, sizeof(c->tls_ca_file), "%s", opts->tls_ca_file);
+
     c->ackrel = (arb_ackrel_t *)calloc(1, sizeof(arb_ackrel_t));
     if (!c->ackrel) {
         free(c);
@@ -685,8 +743,30 @@ int arbitro_client_connect(const char *host, uint16_t port,
         return rc;
     }
 
+#ifdef ARBITRO_TLS
+    if (c->tls_enabled) {
+        rc = arb__tls_connect(c, c->tls_server_name);
+        if (rc != ARBITRO_OK) {
+            arb__net_close(c->sock);
+            free(c->ackrel);
+            free(c);
+            return rc;
+        }
+    }
+#else
+    if (c->tls_enabled) {
+        arb__net_close(c->sock);
+        free(c->ackrel);
+        free(c);
+        return ARBITRO_ERR_STATE;
+    }
+#endif
+
     rc = arb__send_hello(c);
     if (rc != ARBITRO_OK) {
+#ifdef ARBITRO_TLS
+        arb__tls_close(c);
+#endif
         arb__net_close(c->sock);
         free(c->ackrel);
         free(c);
@@ -719,8 +799,11 @@ void arbitro_client_close(arbitro_client_t *c) {
     if (c->connected && c->sock != ARB_SOCK_INVALID) {
         uint8_t hdr[ARB_HDR_LEN];
         arb__hdr_write(hdr, ARB_ACT_DISCONNECT, 0, 0, 0, 0);
-        arb__net_send_all(c->sock, hdr, ARB_HDR_LEN);
+        arb__io_send_all(c, hdr, ARB_HDR_LEN);
     }
+#ifdef ARBITRO_TLS
+    arb__tls_close(c);
+#endif
     arb__net_close(c->sock);
     c->sock = ARB_SOCK_INVALID;
     c->connected = 0;
@@ -779,7 +862,7 @@ static int arb__read_frame(arbitro_client_t *c) {
 
         {
             size_t n = 0;
-            rc = arb__net_recv(c->sock, c->rd_buf + c->rd_len,
+            rc = arb__io_recv(c, c->rd_buf + c->rd_len,
                                c->frame_buf_size - c->rd_len, &n);
             if (rc != ARBITRO_OK) {
                 c->connected = 0;
@@ -796,7 +879,7 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     case ARB_ACT_PING: {
         uint8_t pong[ARB_HDR_LEN];
         arb__hdr_write(pong, ARB_ACT_PONG, 0, 0, 0, fr->seq);
-        return arb__net_send_all(c->sock, pong, ARB_HDR_LEN);
+        return arb__io_send_all(c, pong, ARB_HDR_LEN);
     }
 
     case ARB_ACT_PONG: {
@@ -879,7 +962,7 @@ int arbitro_client_ping(arbitro_client_t *c) {
     arb__hdr_write(hdr, ARB_ACT_PING, 0, 0, 0, 0);
     c->last_ping_sent_ms = arb__now_ms();
     c->last_ping_sent_ns = arb__now_ns();
-    return arb__net_send_all(c->sock, hdr, ARB_HDR_LEN);
+    return arb__io_send_all(c, hdr, ARB_HDR_LEN);
 }
 
 static int arb__keepalive_tick(arbitro_client_t *c) {
@@ -981,7 +1064,7 @@ ARB__UNUSED static int arb__request_ok(arbitro_client_t *c, uint16_t action,
     if (!p) return ARBITRO_ERR_NOMEM;
 
     arb__hdr_write(hdr, action, ARB_FLAG_ACK_REQ, 0, body_len, seq);
-    rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, body, body_len);
+    rc = arb__io_writev2(c, hdr, ARB_HDR_LEN, body, body_len);
     if (rc != ARBITRO_OK) {
         arb__pending_release(p);
         arb__handle_conn_err(c, rc);
@@ -1141,7 +1224,7 @@ static uint32_t arb__publish_body(uint8_t *dst, uint32_t stream_id,
 static int arb__flush_wr(arbitro_client_t *c) {
     int rc;
     if (c->wr_len == 0) return ARBITRO_OK;
-    rc = arb__net_send_all(c->sock, c->wr_buf, c->wr_len);
+    rc = arb__io_send_all(c, c->wr_buf, c->wr_len);
     c->wr_len = 0;
     return rc;
 }
@@ -1361,7 +1444,7 @@ static int arb__ack_flush(arbitro_client_t *c) {
 
     arb__hdr_write(hdr, ARB_ACT_BATCH_ACK, 0, 0, body_len, c->next_seq++);
 
-    rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->ack_buf, body_len);
+    rc = arb__io_writev2(c, hdr, ARB_HDR_LEN, c->ack_buf, body_len);
     if (rc != ARBITRO_OK) {
         uint32_t i;
         for (i = 0; i < flushed; i++) {
@@ -1408,7 +1491,7 @@ int arbitro_msg_nack(arbitro_msg_t *msg) {
     arb__put_u64(frame + ARB_HDR_LEN + 8, msg->seq);
 
     c->m_nacks_sent++;
-    return arb__net_send_all(c->sock, frame, ARB_HDR_LEN + 16);
+    return arb__io_send_all(c, frame, ARB_HDR_LEN + 16);
 }
 
 int arbitro_client_flush_acks(arbitro_client_t *c) {
@@ -1430,7 +1513,7 @@ static int arb__nack_flush(arbitro_client_t *c) {
 
     arb__hdr_write(hdr, ARB_ACT_BATCH_NACK, 0, 0, body_len, c->next_seq++);
 
-    rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->nack_buf, body_len);
+    rc = arb__io_writev2(c, hdr, ARB_HDR_LEN, c->nack_buf, body_len);
     if (rc != ARBITRO_OK) return rc;
 
     c->m_nacks_sent += flushed;
@@ -1551,7 +1634,7 @@ static int arb__send_ack_state_req(arbitro_client_t *c, uint32_t consumer_id, ui
     arb__hdr_write(frame, ARB_ACT_ACK_STATE_REQ, 0, 0, 8, c->next_seq++);
     arb__put_u32(frame + ARB_HDR_LEN + 0, consumer_id);
     arb__put_u32(frame + ARB_HDR_LEN + 4, generation);
-    return arb__net_send_all(c->sock, frame, sizeof(frame));
+    return arb__io_send_all(c, frame, sizeof(frame));
 }
 
 static int arb_ackrel_replay(arbitro_client_t *c) {
@@ -1628,7 +1711,7 @@ static ARB__UNUSED int arb__ackrel_sweep(arbitro_client_t *c) {
             arb__put_u64(body + 16 + j * 8, slot->seqs[j]);
 
         arb__hdr_write(hdr, ARB_ACT_ACK_BATCH, 0, 0, body_len, c->next_seq++);
-        rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, body, body_len);
+        rc = arb__io_writev2(c, hdr, ARB_HDR_LEN, body, body_len);
         if (rc != ARBITRO_OK) return rc;
     }
     return ARBITRO_OK;
@@ -2243,7 +2326,7 @@ int arbitro_publish_batch(arbitro_client_t *c, uint32_t stream_id,
         p = arb__pending_alloc(c, seq);
         if (!p) return ARBITRO_ERR_NOMEM;
 
-        rc = arb__net_send_all(c->sock, c->wr_buf, ARB_HDR_LEN + body_len);
+        rc = arb__io_send_all(c, c->wr_buf, ARB_HDR_LEN + body_len);
         if (rc != ARBITRO_OK) { arb__pending_release(p); return rc; }
 
         {
@@ -2308,7 +2391,7 @@ int arbitro_publish_batch_async(arbitro_client_t *c, uint32_t stream_id,
 
         seq = c->next_seq++;
         arb__hdr_write(c->wr_buf, ARB_ACT_PUBLISH_BATCH, 0, 0, body_len, seq);
-        rc = arb__net_send_all(c->sock, c->wr_buf, ARB_HDR_LEN + body_len);
+        rc = arb__io_send_all(c, c->wr_buf, ARB_HDR_LEN + body_len);
         if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
 
         c->m_publishes_sent++;
@@ -2662,7 +2745,7 @@ int arbitro_publish_with_headers(arbitro_client_t *c, uint32_t stream_id,
                    total_body, c->next_seq++);
 
     c->m_publishes_sent++;
-    return arb__net_send_all(c->sock, buf, ext_off);
+    return arb__io_send_all(c, buf, ext_off);
 }
 
 int arbitro_publish_with_headers_sync(arbitro_client_t *c, uint32_t stream_id,
@@ -2694,7 +2777,7 @@ int arbitro_publish_with_headers_sync(arbitro_client_t *c, uint32_t stream_id,
     p = arb__pending_alloc(c, seq);
     if (!p) return ARBITRO_ERR_NOMEM;
 
-    rc = arb__net_send_all(c->sock, buf, ext_off);
+    rc = arb__io_send_all(c, buf, ext_off);
     if (rc != ARBITRO_OK) { arb__pending_release(p); return arb__handle_conn_err(c, rc); }
 
     {
@@ -2746,7 +2829,7 @@ int arbitro_publish_delayed(arbitro_client_t *c, uint32_t stream_id,
         memcpy(buf + ARB_HDR_LEN + 16 + subject_len, payload, payload_len);
 
     c->m_publishes_sent++;
-    return arb__net_send_all(c->sock, buf, ARB_HDR_LEN + body_len);
+    return arb__io_send_all(c, buf, ARB_HDR_LEN + body_len);
 }
 
 int arbitro_publish_delayed_sync(arbitro_client_t *c, uint32_t stream_id,
@@ -2778,7 +2861,7 @@ int arbitro_publish_delayed_sync(arbitro_client_t *c, uint32_t stream_id,
     p = arb__pending_alloc(c, seq);
     if (!p) return ARBITRO_ERR_NOMEM;
 
-    rc = arb__net_send_all(c->sock, buf, ARB_HDR_LEN + body_len);
+    rc = arb__io_send_all(c, buf, ARB_HDR_LEN + body_len);
     if (rc != ARBITRO_OK) { arb__pending_release(p); return arb__handle_conn_err(c, rc); }
 
     {
@@ -2901,7 +2984,7 @@ static int arb__send_pub_with_reply(arbitro_client_t *c, uint32_t stream_id,
     if (payload_len > 0) memcpy(buf + off, payload, payload_len);
 
     c->m_publishes_sent++;
-    return arb__net_send_all(c->sock, buf, ARB_HDR_LEN + body_len);
+    return arb__io_send_all(c, buf, ARB_HDR_LEN + body_len);
 }
 
 static uint64_t arb__unique_id(void) {
@@ -3371,6 +3454,9 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
 
     if (!c->reconnect) return ARBITRO_ERR_CLOSED;
 
+#ifdef ARBITRO_TLS
+    arb__tls_close(c);
+#endif
     arb__net_close(c->sock);
     c->sock = ARB_SOCK_INVALID;
     c->connected = 0;
@@ -3387,6 +3473,15 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
         }
 #endif
         rc = arb__net_connect(c->host, c->port, c->connect_timeout_ms, &c->sock);
+#ifdef ARBITRO_TLS
+        if (rc == ARBITRO_OK && c->tls_enabled) {
+            rc = arb__tls_connect(c, c->tls_server_name);
+            if (rc != ARBITRO_OK) {
+                arb__net_close(c->sock);
+                c->sock = ARB_SOCK_INVALID;
+            }
+        }
+#endif
         if (rc == ARBITRO_OK) {
             rc = arb__send_hello(c);
             if (rc == ARBITRO_OK) {
@@ -3409,6 +3504,9 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
                 }
                 return ARBITRO_OK;
             }
+#ifdef ARBITRO_TLS
+            arb__tls_close(c);
+#endif
             arb__net_close(c->sock);
             c->sock = ARB_SOCK_INVALID;
         }
@@ -3424,8 +3522,8 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 #ifdef ARBITRO_TLS
-#include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/ssl.h>
 
 static SSL_CTX *arb__tls_ctx = NULL;
 
@@ -3436,12 +3534,73 @@ static int arb__tls_init(void) {
     SSL_load_error_strings();
     arb__tls_ctx = SSL_CTX_new(TLS_client_method());
     if (!arb__tls_ctx) return ARBITRO_ERR_CONNECT;
+    SSL_CTX_set_default_verify_paths(arb__tls_ctx);
     return ARBITRO_OK;
 }
 
-static int arb__tls_connect(arbitro_client_t *c) {
-    (void)c;
-    return ARBITRO_ERR_STATE;
+static int arb__tls_connect(arbitro_client_t *c, const char *host) {
+    SSL *ssl;
+    int rc;
+
+    rc = arb__tls_init();
+    if (rc != ARBITRO_OK) return rc;
+
+    if (c->tls_ca_file[0] &&
+        !SSL_CTX_load_verify_locations(arb__tls_ctx, c->tls_ca_file, NULL))
+        return ARBITRO_ERR_CONNECT;
+
+    ssl = SSL_new(arb__tls_ctx);
+    if (!ssl) return ARBITRO_ERR_CONNECT;
+
+    SSL_set_verify(ssl, c->tls_verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+    if (c->tls_verify)
+        SSL_set1_host(ssl, host);
+    SSL_set_tlsext_host_name(ssl, host);
+
+    if (SSL_set_fd(ssl, (int)c->sock) != 1) {
+        SSL_free(ssl);
+        return ARBITRO_ERR_CONNECT;
+    }
+
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        return ARBITRO_ERR_HANDSHAKE;
+    }
+
+    c->tls_ssl = ssl;
+    return ARBITRO_OK;
+}
+
+static int arb__tls_send_all(arbitro_client_t *c, const uint8_t *buf, size_t len) {
+    SSL *ssl = (SSL *)c->tls_ssl;
+    while (len > 0) {
+        int n = SSL_write(ssl, buf, (int)len);
+        if (n <= 0) return ARBITRO_ERR_SOCKET;
+        buf += n;
+        len -= (size_t)n;
+    }
+    return ARBITRO_OK;
+}
+
+/* writev2's scatter-gather has no TLS equivalent — SSL_write per segment. */
+static int arb__tls_recv(arbitro_client_t *c, uint8_t *buf, size_t cap, size_t *out_n) {
+    SSL *ssl = (SSL *)c->tls_ssl;
+    int n = SSL_read(ssl, buf, (int)cap);
+    if (n <= 0) {
+        int err = SSL_get_error(ssl, n);
+        *out_n = 0;
+        return (err == SSL_ERROR_ZERO_RETURN) ? ARBITRO_ERR_CLOSED : ARBITRO_ERR_SOCKET;
+    }
+    *out_n = (size_t)n;
+    return ARBITRO_OK;
+}
+
+static void arb__tls_close(arbitro_client_t *c) {
+    if (c->tls_ssl) {
+        SSL_shutdown((SSL *)c->tls_ssl);
+        SSL_free((SSL *)c->tls_ssl);
+        c->tls_ssl = NULL;
+    }
 }
 
 #endif /* ARBITRO_TLS */

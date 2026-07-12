@@ -66,6 +66,11 @@ typedef struct arbitro_opts {
     uint32_t reconnect_delay_ms;
     uint32_t keepalive_interval_ms; /* 0 disables client-initiated Ping */
     uint32_t keepalive_timeout_ms;  /* 0 disables Pong-staleness watchdog */
+
+    int         tls_enabled;      /* 0/1 — requires build with ARBITRO_TLS */
+    const char *tls_server_name;  /* SNI override; NULL falls back to host */
+    int         tls_verify;       /* 1 = strict (default), 0 = accept invalid certs */
+    const char *tls_ca_file;      /* NULL = use OpenSSL default trust store */
 } arbitro_opts_t;
 
 void arbitro_opts_init(arbitro_opts_t *opts);
