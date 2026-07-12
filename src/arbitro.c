@@ -82,6 +82,11 @@
 #define ARB_ACT_LIST_CONSUMERS  0x0504
 #define ARB_ACT_CONSUMER_STATS  0x0505
 
+#define ARB_ACT_ACK_STATE_REQ   0x0A01
+#define ARB_ACT_ACK_STATE_REP   0x0A02
+#define ARB_ACT_ACK_BATCH       0x0A03
+#define ARB_ACT_ACK_BATCH_RESP  0x0A04
+
 #define ARB_FLAG_ACK_REQ        0x01
 #define ARB_ENTRY_HAS_HEADERS   0x10
 
@@ -435,6 +440,26 @@ typedef struct {
     int      in_use;
 } arb_waiter_t;
 
+/* Cold tier (ack durability across process restart) is out of scope for
+ * this client — see README-ackrel.md. Hot tier below survives
+ * disconnect+reconnect only, via generation-gated replay. */
+#define ARB_ACKREL_MAX_CONSUMERS 32
+#define ARB_ACKREL_CAP           4096
+#define ARB_ACKREL_SWEEP_MS      100
+#define ARB_ACKREL_BATCH_MAX     256
+
+typedef struct {
+    uint32_t consumer_id;
+    uint32_t generation;
+    int      active;
+    uint32_t count;
+    uint64_t seqs[ARB_ACKREL_CAP];
+} arb_ackrel_slot_t;
+
+typedef struct arb_ackrel {
+    arb_ackrel_slot_t slots[ARB_ACKREL_MAX_CONSUMERS];
+} arb_ackrel_t;
+
 struct arbitro_client {
     arb_sock_t   sock;
     uint64_t     next_seq;
@@ -479,6 +504,9 @@ struct arbitro_client {
     uint64_t     m_replies_recv;
     uint64_t     m_publish_errors;
     uint64_t     m_last_pong_rtt_ns;
+    uint64_t     m_acks_deferred;
+    uint64_t     m_acks_confirmed;
+    uint64_t     m_acks_expired;
 
     size_t       wr_len;
 
@@ -486,6 +514,9 @@ struct arbitro_client {
     uint8_t     *ack_buf;
     uint8_t     *nack_buf;
     uint8_t     *wr_buf;
+
+    arb_ackrel_t *ackrel;
+    uint64_t     last_ackrel_sweep_ms;
 
     arbitro_service_t *default_svc;
     int          default_svc_last_err;
@@ -641,8 +672,15 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->next_seq           = 1;
     c->sock               = ARB_SOCK_INVALID;
 
+    c->ackrel = (arb_ackrel_t *)calloc(1, sizeof(arb_ackrel_t));
+    if (!c->ackrel) {
+        free(c);
+        return ARBITRO_ERR_NOMEM;
+    }
+
     rc = arb__net_connect(host, port, opts->connect_timeout_ms, &c->sock);
     if (rc != ARBITRO_OK) {
+        free(c->ackrel);
         free(c);
         return rc;
     }
@@ -650,6 +688,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
     rc = arb__send_hello(c);
     if (rc != ARBITRO_OK) {
         arb__net_close(c->sock);
+        free(c->ackrel);
         free(c);
         return rc;
     }
@@ -663,6 +702,13 @@ int arbitro_client_connect(const char *host, uint16_t port,
 
 static int arb__ack_flush(arbitro_client_t *c);
 static int arb__nack_flush(arbitro_client_t *c);
+static int arb_ackrel_record(arbitro_client_t *c, uint32_t consumer_id, uint64_t seq);
+static uint32_t arb_ackrel_purge_up_to(arbitro_client_t *c, uint32_t consumer_id, uint64_t cursor);
+static int arb_ackrel_confirm(arbitro_client_t *c, uint32_t consumer_id, uint64_t new_cursor);
+static int arb_ackrel_replay(arbitro_client_t *c);
+static ARB__UNUSED int arb__ackrel_sweep(arbitro_client_t *c);
+static int arb__ackrel_apply_state_rep(arbitro_client_t *c, const uint8_t *body, uint32_t body_len);
+static int arb__ackrel_apply_batch_resp(arbitro_client_t *c, const uint8_t *body, uint32_t body_len);
 
 void arbitro_client_close(arbitro_client_t *c) {
     if (!c) return;
@@ -678,6 +724,10 @@ void arbitro_client_close(arbitro_client_t *c) {
     arb__net_close(c->sock);
     c->sock = ARB_SOCK_INVALID;
     c->connected = 0;
+    if (c->ackrel) {
+        free(c->ackrel);
+        c->ackrel = NULL;
+    }
     free(c);
 }
 
@@ -808,6 +858,12 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
         c->m_deliveries_recv++;
         return arb__dispatch_deliver_single(c, fr->seq, body, body_len);
 
+    case ARB_ACT_ACK_STATE_REP:
+        return arb__ackrel_apply_state_rep(c, body, body_len);
+
+    case ARB_ACT_ACK_BATCH_RESP:
+        return arb__ackrel_apply_batch_resp(c, body, body_len);
+
     default:
         (void)body;
         (void)body_len;
@@ -878,6 +934,8 @@ int arbitro_client_poll(arbitro_client_t *c, int timeout_ms) {
     rc = arb__nack_flush(c);
     if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
     rc = arb__keepalive_tick(c);
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+    rc = arb__ackrel_sweep(c);
     if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
 
     if (c->rd_len > c->rd_off) {
@@ -1304,7 +1362,14 @@ static int arb__ack_flush(arbitro_client_t *c) {
     arb__hdr_write(hdr, ARB_ACT_BATCH_ACK, 0, 0, body_len, c->next_seq++);
 
     rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->ack_buf, body_len);
-    if (rc != ARBITRO_OK) return rc;
+    if (rc != ARBITRO_OK) {
+        uint32_t i;
+        for (i = 0; i < flushed; i++) {
+            uint64_t seq = arb__get_u64(c->ack_buf + 8 + i * 16);
+            arb_ackrel_record(c, c->ack_consumer_id, seq);
+        }
+        return rc;
+    }
 
     c->m_acks_sent += flushed;
     c->ack_count = 0;
@@ -1397,6 +1462,176 @@ int arbitro_msg_nack_delay(arbitro_msg_t *msg, uint32_t delay_ms) {
 
 int arbitro_client_flush_nacks(arbitro_client_t *c) {
     return arb__nack_flush(c);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Ack-reliability hot tier (Wave4 ackrel) — wire 0x0A0x                      */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+static arb_ackrel_slot_t *arb__ackrel_find(arbitro_client_t *c, uint32_t consumer_id) {
+    int i;
+    if (!c || !c->ackrel) return NULL;
+    for (i = 0; i < ARB_ACKREL_MAX_CONSUMERS; i++) {
+        if (c->ackrel->slots[i].active && c->ackrel->slots[i].consumer_id == consumer_id)
+            return &c->ackrel->slots[i];
+    }
+    return NULL;
+}
+
+static arb_ackrel_slot_t *arb__ackrel_find_or_create(arbitro_client_t *c, uint32_t consumer_id) {
+    int i;
+    arb_ackrel_slot_t *slot = arb__ackrel_find(c, consumer_id);
+    if (slot) return slot;
+    if (!c || !c->ackrel) return NULL;
+    for (i = 0; i < ARB_ACKREL_MAX_CONSUMERS; i++) {
+        if (!c->ackrel->slots[i].active) {
+            memset(&c->ackrel->slots[i], 0, sizeof(arb_ackrel_slot_t));
+            c->ackrel->slots[i].consumer_id = consumer_id;
+            c->ackrel->slots[i].active = 1;
+            return &c->ackrel->slots[i];
+        }
+    }
+    return NULL;
+}
+
+static int arb_ackrel_record(arbitro_client_t *c, uint32_t consumer_id, uint64_t seq) {
+    arb_ackrel_slot_t *slot;
+    uint32_t lo, hi, mid;
+
+    if (!c) return ARBITRO_ERR_ARG;
+    slot = arb__ackrel_find_or_create(c, consumer_id);
+    if (!slot) return ARBITRO_ERR_NOMEM;
+
+    lo = 0;
+    hi = slot->count;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (slot->seqs[mid] < seq) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < slot->count && slot->seqs[lo] == seq)
+        return ARBITRO_OK;
+    if (slot->count >= ARB_ACKREL_CAP)
+        return ARBITRO_ERR_NOMEM;
+
+    memmove(&slot->seqs[lo + 1], &slot->seqs[lo],
+            (size_t)(slot->count - lo) * sizeof(uint64_t));
+    slot->seqs[lo] = seq;
+    slot->count++;
+    c->m_acks_deferred++;
+    return ARBITRO_OK;
+}
+
+static uint32_t arb_ackrel_purge_up_to(arbitro_client_t *c, uint32_t consumer_id, uint64_t cursor) {
+    arb_ackrel_slot_t *slot = arb__ackrel_find(c, consumer_id);
+    uint32_t removed, i;
+
+    if (!slot) return 0;
+    removed = 0;
+    while (removed < slot->count && slot->seqs[removed] <= cursor) removed++;
+    if (removed == 0) return 0;
+
+    for (i = removed; i < slot->count; i++)
+        slot->seqs[i - removed] = slot->seqs[i];
+    slot->count -= removed;
+    c->m_acks_confirmed += removed;
+    return removed;
+}
+
+/* AckBatchResp carries only a cursor (no per-seq list), so "confirm" means
+ * purge everything the server has durably committed up to new_cursor. */
+static int arb_ackrel_confirm(arbitro_client_t *c, uint32_t consumer_id, uint64_t new_cursor) {
+    if (!c) return ARBITRO_ERR_ARG;
+    arb_ackrel_purge_up_to(c, consumer_id, new_cursor);
+    return ARBITRO_OK;
+}
+
+static int arb__send_ack_state_req(arbitro_client_t *c, uint32_t consumer_id, uint32_t generation) {
+    uint8_t frame[ARB_HDR_LEN + 8];
+    arb__hdr_write(frame, ARB_ACT_ACK_STATE_REQ, 0, 0, 8, c->next_seq++);
+    arb__put_u32(frame + ARB_HDR_LEN + 0, consumer_id);
+    arb__put_u32(frame + ARB_HDR_LEN + 4, generation);
+    return arb__net_send_all(c->sock, frame, sizeof(frame));
+}
+
+static int arb_ackrel_replay(arbitro_client_t *c) {
+    int i;
+    int rc = ARBITRO_OK;
+    if (!c || !c->ackrel) return ARBITRO_ERR_ARG;
+    for (i = 0; i < ARB_ACKREL_MAX_CONSUMERS; i++) {
+        arb_ackrel_slot_t *slot = &c->ackrel->slots[i];
+        if (!slot->active || slot->count == 0) continue;
+        slot->generation++;
+        rc = arb__send_ack_state_req(c, slot->consumer_id, slot->generation);
+        if (rc != ARBITRO_OK) return rc;
+    }
+    return rc;
+}
+
+static int arb__ackrel_apply_state_rep(arbitro_client_t *c, const uint8_t *body, uint32_t body_len) {
+    uint32_t consumer_id, generation;
+    uint64_t cursor;
+    arb_ackrel_slot_t *slot;
+
+    if (body_len < 40) return ARBITRO_ERR_PROTOCOL;
+    consumer_id = arb__get_u32(body + 0);
+    generation  = arb__get_u32(body + 4);
+    cursor      = arb__get_u64(body + 8);
+
+    slot = arb__ackrel_find(c, consumer_id);
+    if (!slot) return ARBITRO_OK;
+    slot->generation = generation;
+    arb_ackrel_purge_up_to(c, consumer_id, cursor);
+    return ARBITRO_OK;
+}
+
+static int arb__ackrel_apply_batch_resp(arbitro_client_t *c, const uint8_t *body, uint32_t body_len) {
+    uint32_t consumer_id, below_retention;
+    uint64_t new_cursor;
+
+    if (body_len < 32) return ARBITRO_ERR_PROTOCOL;
+    consumer_id     = arb__get_u32(body + 0);
+    new_cursor      = arb__get_u64(body + 4);
+    below_retention = arb__get_u32(body + 20);
+
+    arb_ackrel_confirm(c, consumer_id, new_cursor);
+    c->m_acks_expired += below_retention;
+    return ARBITRO_OK;
+}
+
+static ARB__UNUSED int arb__ackrel_sweep(arbitro_client_t *c) {
+    int i;
+    uint64_t now;
+    if (!c || !c->ackrel) return ARBITRO_OK;
+
+    now = arb__now_ms();
+    if (now - c->last_ackrel_sweep_ms < ARB_ACKREL_SWEEP_MS) return ARBITRO_OK;
+    c->last_ackrel_sweep_ms = now;
+
+    for (i = 0; i < ARB_ACKREL_MAX_CONSUMERS; i++) {
+        arb_ackrel_slot_t *slot = &c->ackrel->slots[i];
+        uint32_t n, body_len, j;
+        uint8_t hdr[ARB_HDR_LEN];
+        uint8_t body[16 + ARB_ACKREL_BATCH_MAX * 8];
+        int rc;
+
+        if (!slot->active || slot->count == 0) continue;
+
+        n = slot->count < ARB_ACKREL_BATCH_MAX ? slot->count : ARB_ACKREL_BATCH_MAX;
+        body_len = 16 + n * 8;
+
+        arb__put_u32(body + 0, slot->consumer_id);
+        arb__put_u32(body + 4, slot->generation);
+        arb__put_u32(body + 8, 0);
+        arb__put_u32(body + 12, n);
+        for (j = 0; j < n; j++)
+            arb__put_u64(body + 16 + j * 8, slot->seqs[j]);
+
+        arb__hdr_write(hdr, ARB_ACT_ACK_BATCH, 0, 0, body_len, c->next_seq++);
+        rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, body, body_len);
+        if (rc != ARBITRO_OK) return rc;
+    }
+    return ARBITRO_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -1531,6 +1766,12 @@ int arbitro_client_run(arbitro_client_t *c) {
             continue;
         }
         rc = arb__keepalive_tick(c);
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+            continue;
+        }
+        rc = arb__ackrel_sweep(c);
         if (rc != ARBITRO_OK) {
             rc = arb__handle_conn_err(c, rc);
             if (rc != ARBITRO_OK) return rc;
@@ -1900,6 +2141,9 @@ void arbitro_client_metrics(const arbitro_client_t *c, arbitro_metrics_t *out) {
     out->replies_recv      = c->m_replies_recv;
     out->publish_errors    = c->m_publish_errors;
     out->last_pong_rtt_ns  = c->m_last_pong_rtt_ns;
+    out->acks_deferred     = c->m_acks_deferred;
+    out->acks_confirmed    = c->m_acks_confirmed;
+    out->acks_expired      = c->m_acks_expired;
 
     for (i = 0; i < ARB_MAX_SUBS; i++)
         if (c->subs[i].active) subs++;
@@ -3155,6 +3399,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
                 c->m_reconnects++;
 
                 arb__resubscribe_all(c);
+                arb_ackrel_replay(c);
 
                 if (c->default_svc) {
                     arbitro_service_destroy(c->default_svc);

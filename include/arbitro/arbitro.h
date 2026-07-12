@@ -206,9 +206,11 @@ typedef struct {
     uint64_t last_pong_rtt_ns;  /* 0 = no pong observed yet */
     uint32_t active_subs;
     uint32_t pending_requests;
-    /* acks_deferred/persisted_cold/expired/confirmed, dedup_hits,
-       manage_requests_sent, suspicious_seq_over_high land in Wave4
-       (ackrel) — not tracked yet. */
+    uint64_t acks_deferred;     /* recorded into the ackrel hot tier */
+    uint64_t acks_confirmed;    /* purged after AckStateRep/AckBatchResp */
+    uint64_t acks_expired;      /* server reported below_retention */
+    /* Cold-tier (ack durability across process restart) is out of scope
+       for this client — see README-ackrel.md. */
 } arbitro_metrics_t;
 
 void arbitro_client_metrics(const arbitro_client_t *c, arbitro_metrics_t *out);
