@@ -52,6 +52,7 @@
 #define ARB_ACT_AUTH            0x0002
 #define ARB_ACT_PING            0x0601
 #define ARB_ACT_PONG            0x0602
+#define ARB_ACT_DISCONNECT      0x0605
 #define ARB_ACT_PUBLISH             0x0101
 #define ARB_ACT_PUBLISH_BATCH       0x0103
 #define ARB_ACT_PUBLISH_WITH_REPLY  0x0104
@@ -163,12 +164,14 @@ const char *arbitro_err_str(int code) {
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 void arbitro_opts_init(arbitro_opts_t *opts) {
-    opts->connect_timeout_ms = 5000;
-    opts->request_timeout_ms = 5000;
-    opts->frame_buf_size     = ARBITRO_DEFAULT_FRAME_BUF;
-    opts->reconnect          = 0;
-    opts->reconnect_max      = 10;
-    opts->reconnect_delay_ms = 500;
+    opts->connect_timeout_ms    = 5000;
+    opts->request_timeout_ms    = 5000;
+    opts->frame_buf_size        = ARBITRO_DEFAULT_FRAME_BUF;
+    opts->reconnect             = 0;
+    opts->reconnect_max         = 0;
+    opts->reconnect_delay_ms    = 500;
+    opts->keepalive_interval_ms = 30000;
+    opts->keepalive_timeout_ms  = 60000;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -386,9 +389,12 @@ ARB__UNUSED static void arb__net_close(arb_sock_t s) {
 
 typedef struct {
     uint32_t consumer_id;
+    uint32_t stream_id;
     arbitro_msg_cb cb;
     void *ud;
     int active;
+    uint8_t  filter[ARBITRO_MAX_SUBJECT_LEN];
+    uint16_t filter_len;
 } arb_sub_t;
 
 typedef struct {
@@ -431,6 +437,10 @@ struct arbitro_client {
     int          reconnect;
     uint32_t     reconnect_max;
     uint32_t     reconnect_delay_ms;
+    uint32_t     keepalive_interval_ms;
+    uint32_t     keepalive_timeout_ms;
+    uint64_t     last_ping_sent_ms;
+    uint64_t     last_pong_ms;
 
     size_t       rd_len;
     size_t       rd_off;
@@ -605,6 +615,8 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->reconnect          = opts->reconnect;
     c->reconnect_max      = opts->reconnect_max;
     c->reconnect_delay_ms = opts->reconnect_delay_ms;
+    c->keepalive_interval_ms = opts->keepalive_interval_ms;
+    c->keepalive_timeout_ms  = opts->keepalive_timeout_ms;
     c->next_seq           = 1;
     c->sock               = ARB_SOCK_INVALID;
 
@@ -622,6 +634,8 @@ int arbitro_client_connect(const char *host, uint16_t port,
     }
 
     c->connected = 1;
+    c->last_ping_sent_ms = arb__now_ms();
+    c->last_pong_ms = 0;
     *out_client = c;
     return ARBITRO_OK;
 }
@@ -633,6 +647,11 @@ void arbitro_client_close(arbitro_client_t *c) {
     if (c->default_svc) {
         arbitro_service_destroy(c->default_svc);
         c->default_svc = NULL;
+    }
+    if (c->connected && c->sock != ARB_SOCK_INVALID) {
+        uint8_t hdr[ARB_HDR_LEN];
+        arb__hdr_write(hdr, ARB_ACT_DISCONNECT, 0, 0, 0, 0);
+        arb__net_send_all(c->sock, hdr, ARB_HDR_LEN);
     }
     arb__net_close(c->sock);
     c->sock = ARB_SOCK_INVALID;
@@ -708,6 +727,10 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
         return arb__net_send_all(c->sock, pong, ARB_HDR_LEN);
     }
 
+    case ARB_ACT_PONG:
+        c->last_pong_ms = arb__now_ms();
+        return ARBITRO_OK;
+
     case ARB_ACT_REP_OK: {
         arb_pending_t *p = arb__pending_find(c, fr->seq);
         if (p) {
@@ -766,6 +789,37 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     }
 }
 
+static ARB__UNUSED int arb__reconnect(arbitro_client_t *c);
+
+int arbitro_client_ping(arbitro_client_t *c) {
+    uint8_t hdr[ARB_HDR_LEN];
+    if (!c || !c->connected) return ARBITRO_ERR_STATE;
+    arb__hdr_write(hdr, ARB_ACT_PING, 0, 0, 0, 0);
+    c->last_ping_sent_ms = arb__now_ms();
+    return arb__net_send_all(c->sock, hdr, ARB_HDR_LEN);
+}
+
+static int arb__keepalive_tick(arbitro_client_t *c) {
+    uint64_t now = arb__now_ms();
+    if (c->keepalive_interval_ms > 0 &&
+        now - c->last_ping_sent_ms >= c->keepalive_interval_ms) {
+        arbitro_client_ping(c);
+    }
+    if (c->keepalive_timeout_ms > 0 && c->last_pong_ms != 0 &&
+        now - c->last_pong_ms > c->keepalive_timeout_ms) {
+        return ARBITRO_ERR_TIMEOUT;
+    }
+    return ARBITRO_OK;
+}
+
+static int arb__handle_conn_err(arbitro_client_t *c, int rc) {
+    if (rc == ARBITRO_ERR_SOCKET || rc == ARBITRO_ERR_CLOSED ||
+        rc == ARBITRO_ERR_TIMEOUT) {
+        if (c->reconnect) return arb__reconnect(c);
+    }
+    return rc;
+}
+
 static int arb__poll_with_timeout(arbitro_client_t *c, int timeout_ms) {
 #ifdef _WIN32
     fd_set rfds;
@@ -791,17 +845,22 @@ int arbitro_client_poll(arbitro_client_t *c, int timeout_ms) {
         return ARBITRO_ERR_STATE;
 
     rc = arb__flush_wr(c);
-    if (rc != ARBITRO_OK) return rc;
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
     rc = arb__ack_flush(c);
-    if (rc != ARBITRO_OK) return rc;
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+    rc = arb__keepalive_tick(c);
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
 
     if (c->rd_len > c->rd_off) {
         size_t avail = c->rd_len - c->rd_off;
         if (avail >= ARB_HDR_LEN) {
             arb_frame_t fr;
             arb__hdr_parse(c->rd_buf + c->rd_off, &fr);
-            if (avail >= ARB_HDR_LEN + fr.msg_len)
-                return arb__read_frame(c);
+            if (avail >= ARB_HDR_LEN + fr.msg_len) {
+                rc = arb__read_frame(c);
+                if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+                return rc;
+            }
         }
     }
 
@@ -813,7 +872,9 @@ int arbitro_client_poll(arbitro_client_t *c, int timeout_ms) {
             return ARBITRO_ERR_TIMEOUT;
     }
 
-    return arb__read_frame(c);
+    rc = arb__read_frame(c);
+    if (rc != ARBITRO_OK) return arb__handle_conn_err(c, rc);
+    return rc;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -836,6 +897,7 @@ ARB__UNUSED static int arb__request_ok(arbitro_client_t *c, uint16_t action,
     rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, body, body_len);
     if (rc != ARBITRO_OK) {
         arb__pending_release(p);
+        arb__handle_conn_err(c, rc);
         return rc;
     }
 
@@ -1146,8 +1208,15 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
     }
 
     slot->consumer_id = consumer_id;
+    slot->stream_id = stream_id;
     slot->cb = cb;
     slot->ud = userdata;
+    slot->filter_len = 0;
+    if (filter && filter_len > 0) {
+        slot->filter_len = filter_len <= ARBITRO_MAX_SUBJECT_LEN
+                          ? filter_len : ARBITRO_MAX_SUBJECT_LEN;
+        memcpy(slot->filter, filter, slot->filter_len);
+    }
     slot->active = 1;
     return ARBITRO_OK;
 }
@@ -1362,11 +1431,48 @@ int arbitro_client_run(arbitro_client_t *c) {
     c->stop_flag = 0;
     while (!c->stop_flag && c->connected) {
         rc = arb__flush_wr(c);
-        if (rc != ARBITRO_OK) return rc;
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+            continue;
+        }
         rc = arb__ack_flush(c);
-        if (rc != ARBITRO_OK) return rc;
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+            continue;
+        }
+        rc = arb__keepalive_tick(c);
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+            continue;
+        }
+
+        if (c->rd_len > c->rd_off) {
+            size_t avail = c->rd_len - c->rd_off;
+            if (avail >= ARB_HDR_LEN) {
+                arb_frame_t fr;
+                arb__hdr_parse(c->rd_buf + c->rd_off, &fr);
+                if (avail >= ARB_HDR_LEN + fr.msg_len) {
+                    rc = arb__read_frame(c);
+                    if (rc != ARBITRO_OK) {
+                        rc = arb__handle_conn_err(c, rc);
+                        if (rc != ARBITRO_OK) return rc;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if (!arb__poll_with_timeout(c, 1000))
+            continue;
+
         rc = arb__read_frame(c);
-        if (rc != ARBITRO_OK) return rc;
+        if (rc != ARBITRO_OK) {
+            rc = arb__handle_conn_err(c, rc);
+            if (rc != ARBITRO_OK) return rc;
+        }
     }
     return ARBITRO_OK;
 }
@@ -1796,15 +1902,6 @@ int arbitro_publish_batch_sync(arbitro_client_t *c, uint32_t stream_id,
                                const arbitro_batch_entry_t *entries, size_t count,
                                uint64_t *out_first_seq) {
     return arbitro_publish_batch(c, stream_id, entries, count, out_first_seq);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════ */
-/* Keepalive                                                                  */
-/* ═══════════════════════════════════════════════════════════════════════════ */
-
-int arbitro_client_ping(arbitro_client_t *c) {
-    (void)c;
-    return ARBITRO_ERR_ARG;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
@@ -2654,10 +2751,63 @@ int arbitro_service_send(arbitro_service_t *svc,
 /* Reconnect                                                                  */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
+static void arb__ensure_rand_seeded(void) {
+    static int seeded = 0;
+    if (seeded) return;
+    {
+        unsigned seed = (unsigned)time(NULL);
+#ifdef _WIN32
+        seed ^= (unsigned)GetCurrentProcessId();
+#else
+        seed ^= (unsigned)getpid();
+#endif
+        srand(seed);
+        seeded = 1;
+    }
+}
+
+#define ARB_RECONNECT_DELAY_CAP_MS 30000u
+
+static uint32_t arb__next_jitter_delay(uint32_t base, uint32_t prev) {
+    uint32_t span, jitter;
+    arb__ensure_rand_seeded();
+    span = (prev * 3 > base) ? (prev * 3 - base) : 0;
+    jitter = span ? ((uint32_t)rand() % (span + 1)) : 0;
+    {
+        uint32_t next = base + jitter;
+        if (next > ARB_RECONNECT_DELAY_CAP_MS) next = ARB_RECONNECT_DELAY_CAP_MS;
+        return next;
+    }
+}
+
+static void arb__resubscribe_all(arbitro_client_t *c) {
+    int i;
+    for (i = 0; i < ARB_MAX_SUBS; i++) {
+        if (c->subs[i].active) {
+            uint8_t body[2048];
+            arb_json_t j;
+            size_t blen;
+            arb__json_begin(&j, body, sizeof(body));
+            arb__json_key(&j, "consumer_id");
+            arb__json_u32(&j, c->subs[i].consumer_id);
+            arb__json_key(&j, "subscription_id");
+            arb__json_u32(&j, 0);
+            arb__json_key(&j, "filters");
+            arb__json_array_begin(&j);
+            if (c->subs[i].filter_len > 0)
+                arb__json_bytes(&j, c->subs[i].filter, c->subs[i].filter_len);
+            arb__json_array_end(&j);
+            blen = arb__json_end(&j);
+            arb__request_ok(c, ARB_ACT_SUBSCRIBE, body, (uint32_t)blen, NULL);
+        }
+    }
+}
+
 static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
-    uint32_t delay = c->reconnect_delay_ms;
+    uint32_t base_delay = c->reconnect_delay_ms;
+    uint32_t delay = base_delay;
     uint32_t attempt;
-    int rc, i;
+    int rc;
 
     if (!c->reconnect) return ARBITRO_ERR_CLOSED;
 
@@ -2665,7 +2815,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
     c->sock = ARB_SOCK_INVALID;
     c->connected = 0;
 
-    for (attempt = 0; attempt < c->reconnect_max; attempt++) {
+    for (attempt = 0; c->reconnect_max == 0 || attempt < c->reconnect_max; attempt++) {
 #ifdef _WIN32
         Sleep(delay);
 #else
@@ -2684,26 +2834,11 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
                 c->rd_len = 0;
                 c->rd_off = 0;
                 c->ack_count = 0;
+                c->last_ping_sent_ms = arb__now_ms();
+                c->last_pong_ms = 0;
                 c->m_reconnects++;
 
-                for (i = 0; i < ARB_MAX_SUBS; i++) {
-                    if (c->subs[i].active) {
-                        uint8_t body[256];
-                        arb_json_t j;
-                        size_t blen;
-                        arb__json_begin(&j, body, sizeof(body));
-                        arb__json_key(&j, "consumer_id");
-                        arb__json_u32(&j, c->subs[i].consumer_id);
-                        arb__json_key(&j, "subscription_id");
-                        arb__json_u32(&j, 0);
-                        arb__json_key(&j, "filters");
-                        arb__json_array_begin(&j);
-                        arb__json_array_end(&j);
-                        blen = arb__json_end(&j);
-                        arb__request_ok(c, ARB_ACT_SUBSCRIBE,
-                                        body, (uint32_t)blen, NULL);
-                    }
-                }
+                arb__resubscribe_all(c);
 
                 if (c->default_svc) {
                     arbitro_service_destroy(c->default_svc);
@@ -2717,8 +2852,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
             c->sock = ARB_SOCK_INVALID;
         }
 
-        delay = delay * 2;
-        if (delay > 30000) delay = 30000;
+        delay = arb__next_jitter_delay(base_delay, delay);
     }
 
     return ARBITRO_ERR_CONNECT;

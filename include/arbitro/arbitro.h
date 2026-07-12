@@ -60,8 +60,10 @@ typedef struct arbitro_opts {
     uint32_t request_timeout_ms;
     uint32_t frame_buf_size;
     int      reconnect;
-    uint32_t reconnect_max;
+    uint32_t reconnect_max;      /* 0 = retry forever (decorrelated jitter backoff) */
     uint32_t reconnect_delay_ms;
+    uint32_t keepalive_interval_ms; /* 0 disables client-initiated Ping */
+    uint32_t keepalive_timeout_ms;  /* 0 disables Pong-staleness watchdog */
 } arbitro_opts_t;
 
 void arbitro_opts_init(arbitro_opts_t *opts);
