@@ -652,6 +652,8 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
                                const uint8_t *body, uint32_t body_len);
 static int arb__dispatch_batch_body(arbitro_client_t *c,
                                     const uint8_t *body, uint32_t body_len);
+static int arb__dispatch_deliver_single(arbitro_client_t *c, uint64_t deliver_seq,
+                                        const uint8_t *body, uint32_t body_len);
 
 static int arb__read_frame(arbitro_client_t *c) {
     size_t avail, need;
@@ -754,8 +756,8 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
         return arb__dispatch_batch_body(c, body, body_len);
 
     case ARB_ACT_DELIVER:
-        c->m_batch_frames_recv++;
-        return arb__dispatch_batch_body(c, body, body_len);
+        c->m_deliveries_recv++;
+        return arb__dispatch_deliver_single(c, fr->seq, body, body_len);
 
     default:
         (void)body;
@@ -1187,18 +1189,24 @@ int arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id) {
 static int arb__ack_flush(arbitro_client_t *c) {
     uint8_t hdr[ARB_HDR_LEN];
     uint32_t body_len;
+    uint32_t flushed;
+    int rc;
 
     if (c->ack_count == 0) return ARBITRO_OK;
 
     arb__put_u32(c->ack_buf + 0, c->ack_consumer_id);
     arb__put_u32(c->ack_buf + 4, c->ack_count);
     body_len = 8 + c->ack_count * 16;
+    flushed = c->ack_count;
 
     arb__hdr_write(hdr, ARB_ACT_BATCH_ACK, 0, 0, body_len, c->next_seq++);
 
-    c->m_acks_sent += c->ack_count;
+    rc = arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->ack_buf, body_len);
+    if (rc != ARBITRO_OK) return rc;
+
+    c->m_acks_sent += flushed;
     c->ack_count = 0;
-    return arb__net_writev2(c->sock, hdr, ARB_HDR_LEN, c->ack_buf, body_len);
+    return ARBITRO_OK;
 }
 
 int arbitro_msg_ack(arbitro_msg_t *msg) {
@@ -1255,6 +1263,40 @@ static int arb__find_sub(arbitro_client_t *c, uint32_t consumer_id,
         }
     }
     return 0;
+}
+
+static int arb__dispatch_deliver_single(arbitro_client_t *c, uint64_t deliver_seq,
+                                        const uint8_t *body, uint32_t body_len) {
+    uint32_t consumer_id, subject_hash;
+    uint16_t subject_len;
+    uint32_t payload_off;
+    arbitro_msg_cb cb;
+    void *ud;
+
+    if (body_len < 12) return ARBITRO_ERR_PROTOCOL;
+
+    consumer_id  = arb__get_u32(body + 0);
+    subject_hash = arb__get_u32(body + 4);
+    subject_len  = arb__get_u16(body + 8);
+
+    payload_off = 12 + (uint32_t)subject_len;
+    if (payload_off > body_len) return ARBITRO_ERR_PROTOCOL;
+
+    if (arb__find_sub(c, consumer_id, &cb, &ud)) {
+        arbitro_msg_t msg;
+        msg.client       = c;
+        msg.subject      = body + 12;
+        msg.subject_len  = subject_len;
+        msg.reply_to     = body + payload_off;
+        msg.reply_len    = 0;
+        msg.data         = body + payload_off;
+        msg.data_len     = body_len - payload_off;
+        msg.seq          = deliver_seq;
+        msg.consumer_id  = consumer_id;
+        msg.subject_hash = subject_hash;
+        cb(&msg, ud);
+    }
+    return ARBITRO_OK;
 }
 
 static int arb__dispatch_batch_body(arbitro_client_t *c,
@@ -1827,7 +1869,10 @@ int arbitro_consumer_upsert(arbitro_client_t *c, const char *stream,
                             uint32_t *out_consumer_id) {
     int rc = arbitro_consumer_create(c, stream, cfg, out_consumer_id);
     if (rc == ARBITRO_ERR_BROKER) {
-        rc = ARBITRO_OK;
+        arbitro_consumer_info_t info;
+        rc = arbitro_consumer_info(c, stream, cfg->name, &info);
+        if (rc == ARBITRO_OK && out_consumer_id)
+            *out_consumer_id = info.consumer_id;
     }
     return rc;
 }
@@ -1857,7 +1902,12 @@ int arbitro_resolve_stream_id(arbitro_client_t *c, const char *stream_name,
     rc = arb__request_ok(c, ARB_ACT_STREAM_INFO, body, (uint32_t)blen, &rep);
     if (rc != ARBITRO_OK) { if (rep) arb__pending_release(rep); return rc; }
 
-    if (rep && rep->rep_len >= 8) {
+    if (!rep || rep->rep_len < 8) {
+        if (rep) arb__pending_release(rep);
+        return ARBITRO_ERR_PROTOCOL;
+    }
+
+    {
         uint32_t id = (uint32_t)arb__get_u64(rep->rep_buf);
         *out_stream_id = id;
 
@@ -1870,7 +1920,7 @@ int arbitro_resolve_stream_id(arbitro_client_t *c, const char *stream_name,
             }
         }
     }
-    if (rep) arb__pending_release(rep);
+    arb__pending_release(rep);
     return ARBITRO_OK;
 }
 

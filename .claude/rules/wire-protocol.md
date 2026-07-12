@@ -1,6 +1,9 @@
 # Wire Protocol Reference
 
-Source of truth: `arbitro-proto` crate in the broker repo.
+Source of truth: `arbitro-proto` crate in the broker repo, specifically
+`arbitro-proto/src/action.rs` for action codes and
+`arbitro-client-tokio/src/consume/demux.rs` for the Deliver/RepBatch wire
+shapes. Regenerate this file whenever those change.
 
 ## Connection
 
@@ -31,40 +34,67 @@ Envelope header (RepBatch 0x0205, FanoutBatch 0x0207 only):
 
 CRITICAL: The read loop MUST branch on action to determine msg_len offset.
 
-## Action Codes (hot path)
+## Action Codes
 
-| Code   | Name          | Direction      |
-|--------|---------------|----------------|
-| 0x0101 | Publish       | client→server  |
-| 0x0103 | PublishBatch  | client→server  |
-| 0x0200 | Deliver       | server→client  |
-| 0x0201 | Ack           | client→server  |
-| 0x0202 | Nack          | client→server  |
-| 0x0203 | RepOk         | server→client  |
-| 0x0204 | RepError      | server→client  |
-| 0x0205 | RepBatch      | server→client  |
-| 0x0206 | BatchAck      | client→server  |
-| 0x0207 | FanoutBatch   | server→client  |
-| 0x0001 | Ping          | server→client  |
-| 0x0002 | Auth          | client→server  |
+Matches `arbitro-proto/src/action.rs::Action` exactly. Direction is
+relative to the client.
 
-## Action Codes (cold path — JSON body)
+| Code   | Name             | Direction      |
+|--------|------------------|----------------|
+| 0x0001 | Hello            | client→server (pre-Header, 8B HelloFrame) |
+| 0x0002 | Auth             | client→server  |
+| 0x0101 | Publish          | client→server  |
+| 0x0103 | PublishBatch     | client→server  |
+| 0x0104 | PublishWithReply | client→server  |
+| 0x0200 | Deliver          | server→client  |
+| 0x0201 | Ack              | client→server  |
+| 0x0202 | Nack             | client→server  |
+| 0x0203 | RepOk            | server→client  |
+| 0x0204 | RepError         | server→client  |
+| 0x0205 | RepBatch         | server→client  |
+| 0x0206 | BatchAck         | client→server  |
+| 0x0207 | FanoutBatch      | server→client  |
+| 0x020A | BatchNack        | client→server  |
+| 0x020B | AckTerm          | client→server  |
+| 0x0301 | Subscribe        | client→server  |
+| 0x0302 | Unsubscribe      | client→server  |
+| 0x0401 | CreateStream     | client→server  |
+| 0x0402 | DeleteStream     | client→server  |
+| 0x0403 | GetStream (StreamInfo) | client→server |
+| 0x0404 | ListStreams      | client→server  |
+| 0x0405 | PurgeStream      | client→server  |
+| 0x0406 | DrainSubject     | client→server  |
+| 0x0407 | DeleteMessage    | client→server  |
+| 0x0501 | CreateConsumer   | client→server  |
+| 0x0502 | DeleteConsumer   | client→server  |
+| 0x0503 | GetConsumer (ConsumerInfo) | client→server |
+| 0x0504 | ListConsumers    | client→server  |
+| 0x0505 | ConsumerStats    | client→server  |
+| 0x0506 | PauseConsumer    | client→server  |
+| 0x0507 | ResumeConsumer   | client→server  |
+| 0x0601 | Ping             | server→client  |
+| 0x0602 | Pong             | client→server  |
+| 0x0605 | Disconnect       | server→client  |
+| 0x0701 | CreateCron       | client→server  |
+| 0x0702 | DeleteCron       | client→server  |
+| 0x0703 | ListCrons        | client→server  |
+| 0x0704 | CronFire         | server→client  |
+| 0x0705 | CronAck          | client→server  |
+| 0x0801 | PublishDelayed   | client→server  |
+| 0x0A01 | AckStateReq      | client→server  |
+| 0x0A02 | AckStateRep      | server→client  |
+| 0x0A03 | AckBatch         | client→server  |
+| 0x0A04 | AckBatchResp     | server→client  |
 
-| Code   | Name            |
-|--------|-----------------|
-| 0x0301 | CreateStream    |
-| 0x0302 | DeleteStream    |
-| 0x0303 | CreateConsumer  |
-| 0x0304 | DeleteConsumer  |
-| 0x0305 | Subscribe       |
-| 0x0306 | Unsubscribe     |
-| 0x0310 | ListStreams     |
-| 0x0311 | StreamInfo      |
-| 0x0320 | ListConsumers   |
-| 0x0321 | ConsumerInfo    |
-| 0x0400 | PurgeStream     |
-| 0x0401 | DrainSubject    |
-| 0x0402 | DeleteMessage   |
+Reserved / deleted slots — do not reuse: `0x0102`, `0x0105`, `0x0106`,
+`0x0208`, `0x0209`, `0x0603`, `0x0604`, `0x0901..=0x0908`.
+
+The C client (`arbitro.c`) currently implements the hot-path subset
+(`ARB_ACT_*` macros at `arbitro.c:51-80`) plus the cold-path management
+codes it needs (Subscribe, CreateStream/DeleteStream/StreamInfo/
+ListStreams/PurgeStream/DrainSubject/DeleteMessage,
+CreateConsumer/DeleteConsumer/ConsumerInfo/ListConsumers). It does not
+yet implement Cron, AckState, or Pause/Resume actions.
 
 ## Publish Body (after standard 16B header)
 
@@ -75,9 +105,27 @@ CRITICAL: The read loop MUST branch on action to determine msg_len offset.
 [8:..]  subject[subject_len] + msg_id[msg_id_len] + payload[remainder]
 ```
 
-## RepBatch Entry (inside RepBatch body)
+## Deliver Body (single delivery, action 0x0200)
 
-Body starts with `[count:u16][pad:u16]`, then N entries:
+Uses the **standard 16B header** (not Envelope) — `seq` at header offset
+`[8:16]` is the delivery sequence. Body immediately after the header is
+a fixed 12-byte `DeliverBody`, then the subject, then the payload:
+
+```
+[0:4]   consumer_id   u32
+[4:8]   subject_hash  u32
+[8:10]  subject_len   u16
+[10:12] pad           u16
+[12:..]  subject[subject_len] + payload[remainder]
+```
+
+Single Deliver does not carry a `reply_to` — that field is empty on the
+client-side message view.
+
+## RepBatch / FanoutBatch Entry (inside RepBatch/FanoutBatch body)
+
+Uses the **Envelope 16B header** — body starts with `[count:u16][pad:u16]`,
+then N entries:
 ```
 [0:4]   consumer_id   u32
 [4:12]  seq           u64
