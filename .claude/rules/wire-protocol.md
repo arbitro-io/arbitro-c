@@ -94,7 +94,9 @@ The C client (`arbitro.c`) currently implements the hot-path subset
 codes it needs (Subscribe, CreateStream/DeleteStream/StreamInfo/
 ListStreams/PurgeStream/DrainSubject/DeleteMessage,
 CreateConsumer/DeleteConsumer/ConsumerInfo/ListConsumers). It does not
-yet implement Cron, AckState, or Pause/Resume actions.
+implement Cron, Workflow, or Pause/Resume actions (intentionally out of
+scope for an embeddable C client). AckState (0x0A01-0x0A04) is fully
+supported since Wave4a — see the ackrel section below.
 
 ## Publish Body (after standard 16B header)
 
