@@ -5,8 +5,20 @@
 #include <string.h>
 
 static const char *get_addr(void) {
+    static char host[128];
     const char *addr = getenv("ARBITRO_ADDR");
-    return addr ? addr : "127.0.0.1";
+    if (!addr) return "127.0.0.1";
+    {
+        const char *colon = strchr(addr, ':');
+        if (colon) {
+            size_t n = (size_t)(colon - addr);
+            if (n >= sizeof(host)) n = sizeof(host) - 1;
+            memcpy(host, addr, n);
+            host[n] = '\0';
+            return host;
+        }
+    }
+    return addr;
 }
 
 static uint16_t get_port(void) {
