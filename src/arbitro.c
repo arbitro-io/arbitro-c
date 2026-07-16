@@ -81,6 +81,8 @@
 #define ARB_ACT_CONSUMER_INFO   0x0503
 #define ARB_ACT_LIST_CONSUMERS  0x0504
 #define ARB_ACT_CONSUMER_STATS  0x0505
+#define ARB_ACT_PAUSE_CONSUMER  0x0506
+#define ARB_ACT_RESUME_CONSUMER 0x0507
 
 #define ARB_ACT_ACK_STATE_REQ   0x0A01
 #define ARB_ACT_ACK_STATE_REP   0x0A02
@@ -2033,9 +2035,9 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
     return rc;
 }
 
-int arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
-                            const char *consumer) {
-    uint8_t body[512];
+static int arb__consumer_id_op(arbitro_client_t *c, const char *stream,
+                               const char *consumer, uint16_t action) {
+    uint8_t body[64];
     arb_json_t j;
     size_t blen;
     arbitro_consumer_info_t info = {0};
@@ -2051,7 +2053,22 @@ int arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
     blen = arb__json_end(&j);
     if (blen == 0) return ARBITRO_ERR_ARG;
 
-    return arb__request_ok(c, ARB_ACT_DELETE_CONSUMER, body, (uint32_t)blen, NULL);
+    return arb__request_ok(c, action, body, (uint32_t)blen, NULL);
+}
+
+int arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
+                            const char *consumer) {
+    return arb__consumer_id_op(c, stream, consumer, ARB_ACT_DELETE_CONSUMER);
+}
+
+int arbitro_pause_consumer(arbitro_client_t *c, const char *stream,
+                           const char *consumer) {
+    return arb__consumer_id_op(c, stream, consumer, ARB_ACT_PAUSE_CONSUMER);
+}
+
+int arbitro_resume_consumer(arbitro_client_t *c, const char *stream,
+                            const char *consumer) {
+    return arb__consumer_id_op(c, stream, consumer, ARB_ACT_RESUME_CONSUMER);
 }
 
 int arbitro_get_pending(arbitro_client_t *c, uint32_t consumer_id,

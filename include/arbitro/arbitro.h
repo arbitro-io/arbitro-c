@@ -186,6 +186,10 @@ int  arbitro_consumer_create(arbitro_client_t *c, const char *stream,
                              uint32_t *out_consumer_id);
 int  arbitro_consumer_delete(arbitro_client_t *c, const char *stream,
                              const char *consumer);
+int  arbitro_pause_consumer(arbitro_client_t *c, const char *stream,
+                            const char *consumer);
+int  arbitro_resume_consumer(arbitro_client_t *c, const char *stream,
+                             const char *consumer);
 int  arbitro_get_pending(arbitro_client_t *c, uint32_t consumer_id,
                          uint64_t *out_pending);
 
