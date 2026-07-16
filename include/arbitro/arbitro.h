@@ -267,6 +267,7 @@ int  arbitro_consumer_list(arbitro_client_t *c, const char *stream,
                            arbitro_consumer_info_t *out, size_t cap,
                            size_t *out_n);
 int  arbitro_stream_exists(arbitro_client_t *c, const char *name);
+int  arbitro_consumer_exists(arbitro_client_t *c, const char *stream, const char *consumer);
 
 typedef struct {
     const uint8_t *key;

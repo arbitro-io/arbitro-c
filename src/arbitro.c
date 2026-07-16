@@ -2661,6 +2661,14 @@ int arbitro_stream_exists(arbitro_client_t *c, const char *name) {
     return rc;
 }
 
+int arbitro_consumer_exists(arbitro_client_t *c, const char *stream, const char *consumer) {
+    arbitro_consumer_info_t info;
+    int rc = arbitro_consumer_info(c, stream, consumer, &info);
+    if (rc == ARBITRO_OK) return 1;
+    if (rc == ARBITRO_ERR_BROKER) return 0;
+    return rc;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /* Publish with headers (TLV)                                                 */
 /* ═══════════════════════════════════════════════════════════════════════════ */
