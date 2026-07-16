@@ -135,6 +135,20 @@ int  arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
                               arbitro_msg_cb cb, void *userdata);
 int  arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id);
 
+typedef struct {
+    const uint8_t *name;
+    uint16_t       name_len;
+    uint64_t       fire_time_ms;
+    uint64_t       fire_count;
+} arbitro_cron_fire_t;
+
+typedef int (*arbitro_cron_cb)(const arbitro_cron_fire_t *fire, void *user);
+
+int  arbitro_cron_create(arbitro_client_t *c, const char *name,
+                         const char *cron_expr, const char *tz,
+                         arbitro_cron_cb cb, void *user);
+int  arbitro_cron_delete(arbitro_client_t *c, const char *name);
+
 int  arbitro_msg_ack(arbitro_msg_t *msg);
 int  arbitro_msg_nack(arbitro_msg_t *msg);
 int  arbitro_msg_nack_delay(arbitro_msg_t *msg, uint32_t delay_ms);

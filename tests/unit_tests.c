@@ -546,6 +546,124 @@ ARB_TEST(test_opts_defaults) {
     ARB_PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Cron — CreateCron JSON body, CronFire decode, CronAck encode              */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+ARB_TEST(test_cron_body_with_tz) {
+    uint8_t body[512];
+    size_t n = arb__cron_body(body, sizeof(body), "job-1", "0 * * * *", "UTC");
+    const char *want =
+        "{\"name\":\"job-1\",\"every\":\"0 * * * *\",\"tz\":\"UTC\","
+        "\"timeout_ms\":0,\"overlap\":false}";
+    ARB_ASSERT_EQ(n, strlen(want));
+    ARB_ASSERT_MEM(body, want, n);
+    ARB_PASS();
+}
+
+ARB_TEST(test_cron_body_no_tz) {
+    uint8_t body[512];
+    size_t n = arb__cron_body(body, sizeof(body), "job-2", "*/5 * * * *", NULL);
+    const char *want =
+        "{\"name\":\"job-2\",\"every\":\"*/5 * * * *\","
+        "\"timeout_ms\":0,\"overlap\":false}";
+    ARB_ASSERT_EQ(n, strlen(want));
+    ARB_ASSERT_MEM(body, want, n);
+    ARB_PASS();
+}
+
+ARB_TEST(test_cron_ack_encode) {
+    uint8_t frame[64];
+    arb_frame_t fr;
+    const char *name = "job-a";
+    uint32_t total = arb__cron_ack_encode(frame, 7, (const uint8_t *)name, 5, 1);
+
+    ARB_ASSERT_EQ(total, (uint32_t)(ARB_HDR_LEN + 3 + 5));
+    arb__hdr_parse(frame, &fr);
+    ARB_ASSERT_EQ(fr.action, ARB_ACT_CRON_ACK);
+    ARB_ASSERT_EQ(fr.seq, 7u);
+    ARB_ASSERT_EQ(fr.msg_len, 8u);
+    ARB_ASSERT_EQ(arb__get_u16(frame + ARB_HDR_LEN), 5u);
+    ARB_ASSERT_EQ(frame[ARB_HDR_LEN + 2], 0u);
+    ARB_ASSERT_MEM(frame + ARB_HDR_LEN + 3, name, 5);
+    ARB_PASS();
+}
+
+ARB_TEST(test_cron_ack_encode_error_status) {
+    uint8_t frame[64];
+    uint32_t total = arb__cron_ack_encode(frame, 1, (const uint8_t *)"j", 1, 0);
+    ARB_ASSERT_EQ(total, (uint32_t)(ARB_HDR_LEN + 4));
+    ARB_ASSERT_EQ(frame[ARB_HDR_LEN + 2], 1u);
+    ARB_PASS();
+}
+
+static arbitro_cron_fire_t g_cron_last_fire;
+static int g_cron_fire_hits;
+static int arb__test_cron_cb(const arbitro_cron_fire_t *fire, void *user) {
+    g_cron_last_fire = *fire;
+    g_cron_fire_hits++;
+    return user ? *(int *)user : 0;
+}
+
+ARB_TEST(test_cron_fire_dispatch_decodes_and_invokes) {
+    arbitro_client_t *c = arb__test_make_client();
+    uint8_t fbody[ARB_CRON_FIRE_FIXED + 8];
+    const char *name = "nightly";
+    uint16_t nlen = (uint16_t)strlen(name);
+
+    arb_cron_t *slot = arb__cron_alloc(c);
+    ARB_ASSERT(slot != NULL);
+    memcpy(slot->name, name, nlen);
+    slot->name_len = nlen;
+    slot->cb = arb__test_cron_cb;
+    slot->ud = NULL;
+    slot->active = 1;
+
+    arb__put_u16(fbody, nlen);
+    arb__put_u64(fbody + 2, 1752000000000ULL);
+    arb__put_u64(fbody + 10, 42);
+    memcpy(fbody + ARB_CRON_FIRE_FIXED, name, nlen);
+
+    g_cron_fire_hits = 0;
+    arb__dispatch_cron_fire(c, fbody, ARB_CRON_FIRE_FIXED + nlen);
+
+    ARB_ASSERT_EQ(g_cron_fire_hits, 1);
+    ARB_ASSERT_EQ(g_cron_last_fire.name_len, nlen);
+    ARB_ASSERT_EQ(g_cron_last_fire.fire_time_ms, 1752000000000ULL);
+    ARB_ASSERT_EQ(g_cron_last_fire.fire_count, 42u);
+    ARB_ASSERT_MEM(g_cron_last_fire.name, name, nlen);
+
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
+ARB_TEST(test_cron_fire_dispatch_unknown_name_ignored) {
+    arbitro_client_t *c = arb__test_make_client();
+    uint8_t fbody[ARB_CRON_FIRE_FIXED + 4];
+    const char *name = "gone";
+
+    arb__put_u16(fbody, 4);
+    arb__put_u64(fbody + 2, 1);
+    arb__put_u64(fbody + 10, 1);
+    memcpy(fbody + ARB_CRON_FIRE_FIXED, name, 4);
+
+    g_cron_fire_hits = 0;
+    ARB_ASSERT_EQ(arb__dispatch_cron_fire(c, fbody, ARB_CRON_FIRE_FIXED + 4),
+                  ARBITRO_OK);
+    ARB_ASSERT_EQ(g_cron_fire_hits, 0);
+
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
+ARB_TEST(test_cron_fire_dispatch_truncated) {
+    arbitro_client_t *c = arb__test_make_client();
+    uint8_t fbody[4] = {1, 2, 3, 4};
+    ARB_ASSERT_EQ(arb__dispatch_cron_fire(c, fbody, 4), ARBITRO_OK);
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
 int main(void) {
     fprintf(stdout, "arbitro-c unit tests\n");
     ARB_RUN_TESTS();

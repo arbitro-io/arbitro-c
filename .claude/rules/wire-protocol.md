@@ -94,10 +94,38 @@ The C client (`arbitro.c`) currently implements the hot-path subset
 codes it needs (Subscribe, CreateStream/DeleteStream/StreamInfo/
 ListStreams/PurgeStream/DrainSubject/DeleteMessage,
 CreateConsumer/DeleteConsumer/ConsumerInfo/ListConsumers/PauseConsumer/
-ResumeConsumer). It does not implement Cron or Workflow actions
-(intentionally out of scope for an embeddable C client). AckState
-(0x0A01-0x0A04) is fully supported since Wave4a — see the ackrel section
-below.
+ResumeConsumer). Cron (0x0701 CreateCron, 0x0702 DeleteCron, 0x0704
+CronFire, 0x0705 CronAck) is now implemented — `arbitro_cron_create` /
+`arbitro_cron_delete` with a fixed-size in-client registry and CronFire→
+CronAck dispatch in the read loop (see the Cron Frames section below).
+Workflow actions remain intentionally out of scope for an embeddable C
+client. AckState (0x0A01-0x0A04) is fully supported since Wave4a — see the
+ackrel section below.
+
+## Cron Frames
+
+CreateCron (0x0701) body is cold-path JSON matching `wire/cron.rs`
+`CreateCronBody`: `{"name":String,"every":String,"tz":String?,"timeout_ms":u32,"overlap":bool}`.
+`name`/`every`/`tz` are JSON strings (NOT byte arrays); `tz` is omitted
+when empty. The C client always emits `timeout_ms:0` and `overlap:false`.
+Reply is binary RepOk/RepError.
+
+DeleteCron (0x0702) body is the raw cron name bytes (no JSON).
+
+CronFire (0x0704, server→client) fixed LE body:
+```
+[0:2]  name_len  u16
+[2:10] fire_time_ms u64
+[10:18] fire_count u64
+[18:..] name[name_len]
+```
+
+CronAck (0x0705, client→server) fixed LE body:
+```
+[0:2] name_len u16
+[2:3] status   u8   (0=ok, 1=error)
+[3:..] name[name_len]
+```
 
 ## Publish Body (after standard 16B header)
 

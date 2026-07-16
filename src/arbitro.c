@@ -84,6 +84,12 @@
 #define ARB_ACT_PAUSE_CONSUMER  0x0506
 #define ARB_ACT_RESUME_CONSUMER 0x0507
 
+#define ARB_ACT_CREATE_CRON     0x0701
+#define ARB_ACT_DELETE_CRON     0x0702
+#define ARB_ACT_LIST_CRONS      0x0703
+#define ARB_ACT_CRON_FIRE       0x0704
+#define ARB_ACT_CRON_ACK        0x0705
+
 #define ARB_ACT_ACK_STATE_REQ   0x0A01
 #define ARB_ACT_ACK_STATE_REP   0x0A02
 #define ARB_ACT_ACK_BATCH       0x0A03
@@ -467,6 +473,23 @@ typedef struct arb_ackrel {
     arb_ackrel_slot_t slots[ARB_ACKREL_MAX_CONSUMERS];
 } arb_ackrel_t;
 
+#define ARB_MAX_CRONS       32
+#define ARB_CRON_NAME_MAX   128
+#define ARB_CRON_EXPR_MAX   128
+#define ARB_CRON_TZ_MAX     64
+#define ARB_CRON_FIRE_FIXED 18
+
+typedef struct {
+    int             active;
+    char            name[ARB_CRON_NAME_MAX];
+    uint16_t        name_len;
+    char            expr[ARB_CRON_EXPR_MAX];
+    char            tz[ARB_CRON_TZ_MAX];
+    int             has_tz;
+    arbitro_cron_cb cb;
+    void           *ud;
+} arb_cron_t;
+
 struct arbitro_client {
     arb_sock_t   sock;
     uint64_t     next_seq;
@@ -496,6 +519,7 @@ struct arbitro_client {
     uint32_t     nack_consumer_id;
 
     arb_sub_t    subs[ARB_MAX_SUBS];
+    arb_cron_t   crons[ARB_MAX_CRONS];
     arb_pending_t pending[ARB_MAX_PENDING];
     arb_stream_cache_t stream_cache[ARB_MAX_STREAMS];
     arb_waiter_t waiters[ARB_MAX_WAITERS];
@@ -830,6 +854,8 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
                                     const uint8_t *body, uint32_t body_len);
 static int arb__dispatch_deliver_single(arbitro_client_t *c, uint64_t deliver_seq,
                                         const uint8_t *body, uint32_t body_len);
+static int arb__dispatch_cron_fire(arbitro_client_t *c,
+                                   const uint8_t *body, uint32_t body_len);
 
 static int arb__read_frame(arbitro_client_t *c) {
     size_t avail, need;
@@ -942,6 +968,9 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     case ARB_ACT_DELIVER:
         c->m_deliveries_recv++;
         return arb__dispatch_deliver_single(c, fr->seq, body, body_len);
+
+    case ARB_ACT_CRON_FIRE:
+        return arb__dispatch_cron_fire(c, body, body_len);
 
     case ARB_ACT_ACK_STATE_REP:
         return arb__ackrel_apply_state_rep(c, body, body_len);
@@ -1150,6 +1179,32 @@ ARB__UNUSED static void arb__json_bytes(arb_json_t *j, const uint8_t *data, size
         arb__json_raw(j, num, (size_t)n);
     }
     arb__json_raw(j, "]", 1);
+    j->needs_comma = 1;
+}
+
+ARB__UNUSED static void arb__json_str(arb_json_t *j, const char *s) {
+    arb__json_raw(j, "\"", 1);
+    for (; *s; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch == '"' || ch == '\\') {
+            char e[2]; e[0] = '\\'; e[1] = (char)ch;
+            arb__json_raw(j, e, 2);
+        } else if (ch == '\n') {
+            arb__json_raw(j, "\\n", 2);
+        } else if (ch == '\r') {
+            arb__json_raw(j, "\\r", 2);
+        } else if (ch == '\t') {
+            arb__json_raw(j, "\\t", 2);
+        } else if (ch < 0x20) {
+            char u[8];
+            int n = snprintf(u, sizeof(u), "\\u%04x", ch);
+            arb__json_raw(j, u, (size_t)n);
+        } else {
+            char cc = (char)ch;
+            arb__json_raw(j, &cc, 1);
+        }
+    }
+    arb__json_raw(j, "\"", 1);
     j->needs_comma = 1;
 }
 
@@ -2033,6 +2088,160 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
         *out_consumer_id = (uint32_t)rep->rep_u64;
     if (rep) arb__pending_release(rep);
     return rc;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Cron (cold path — registry + CronFire/CronAck dispatch)                    */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+static arb_cron_t *arb__cron_find(arbitro_client_t *c,
+                                  const uint8_t *name, uint16_t name_len) {
+    int i;
+    for (i = 0; i < ARB_MAX_CRONS; i++) {
+        if (c->crons[i].active && c->crons[i].name_len == name_len &&
+            memcmp(c->crons[i].name, name, name_len) == 0)
+            return &c->crons[i];
+    }
+    return NULL;
+}
+
+static arb_cron_t *arb__cron_alloc(arbitro_client_t *c) {
+    int i;
+    for (i = 0; i < ARB_MAX_CRONS; i++)
+        if (!c->crons[i].active) return &c->crons[i];
+    return NULL;
+}
+
+static size_t arb__cron_body(uint8_t *buf, size_t cap, const char *name,
+                             const char *expr, const char *tz) {
+    arb_json_t j;
+    arb__json_begin(&j, buf, cap);
+    arb__json_key(&j, "name");
+    arb__json_str(&j, name);
+    arb__json_key(&j, "every");
+    arb__json_str(&j, expr);
+    if (tz && tz[0]) {
+        arb__json_key(&j, "tz");
+        arb__json_str(&j, tz);
+    }
+    arb__json_key(&j, "timeout_ms");
+    arb__json_u32(&j, 0);
+    arb__json_key(&j, "overlap");
+    arb__json_bool(&j, 0);
+    return arb__json_end(&j);
+}
+
+int arbitro_cron_create(arbitro_client_t *c, const char *name,
+                        const char *cron_expr, const char *tz,
+                        arbitro_cron_cb cb, void *user) {
+    uint8_t body[512];
+    size_t blen, nlen;
+    arb_cron_t *slot;
+    int rc;
+
+    if (!c || !name || !name[0] || !cron_expr || !cron_expr[0] || !cb)
+        return ARBITRO_ERR_ARG;
+    nlen = strlen(name);
+    if (nlen >= ARB_CRON_NAME_MAX || strlen(cron_expr) >= ARB_CRON_EXPR_MAX)
+        return ARBITRO_ERR_ARG;
+    if (tz && strlen(tz) >= ARB_CRON_TZ_MAX)
+        return ARBITRO_ERR_ARG;
+
+    slot = arb__cron_find(c, (const uint8_t *)name, (uint16_t)nlen);
+    if (!slot) slot = arb__cron_alloc(c);
+    if (!slot) return ARBITRO_ERR_NOMEM;
+
+    blen = arb__cron_body(body, sizeof(body), name, cron_expr, tz);
+    if (blen == 0) return ARBITRO_ERR_ARG;
+
+    rc = arb__request_ok(c, ARB_ACT_CREATE_CRON, body, (uint32_t)blen, NULL);
+    if (rc != ARBITRO_OK) return rc;
+
+    memcpy(slot->name, name, nlen);
+    slot->name[nlen] = '\0';
+    slot->name_len = (uint16_t)nlen;
+    snprintf(slot->expr, sizeof(slot->expr), "%s", cron_expr);
+    if (tz && tz[0]) {
+        snprintf(slot->tz, sizeof(slot->tz), "%s", tz);
+        slot->has_tz = 1;
+    } else {
+        slot->tz[0] = '\0';
+        slot->has_tz = 0;
+    }
+    slot->cb = cb;
+    slot->ud = user;
+    slot->active = 1;
+    return ARBITRO_OK;
+}
+
+int arbitro_cron_delete(arbitro_client_t *c, const char *name) {
+    arb_cron_t *slot;
+    int rc;
+    if (!c || !name || !name[0]) return ARBITRO_ERR_ARG;
+
+    rc = arb__request_ok(c, ARB_ACT_DELETE_CRON,
+                         (const uint8_t *)name, (uint32_t)strlen(name), NULL);
+
+    slot = arb__cron_find(c, (const uint8_t *)name, (uint16_t)strlen(name));
+    if (slot) slot->active = 0;
+    return rc;
+}
+
+static uint32_t arb__cron_ack_encode(uint8_t *frame, uint64_t seq,
+                                     const uint8_t *name, uint16_t name_len, int ok) {
+    uint32_t body_len = 3u + name_len;
+    arb__hdr_write(frame, ARB_ACT_CRON_ACK, 0, 0, body_len, seq);
+    arb__put_u16(frame + ARB_HDR_LEN, name_len);
+    frame[ARB_HDR_LEN + 2] = ok ? 0 : 1;
+    memcpy(frame + ARB_HDR_LEN + 3, name, name_len);
+    return ARB_HDR_LEN + body_len;
+}
+
+static int arb__send_cron_ack(arbitro_client_t *c, const uint8_t *name,
+                              uint16_t name_len, int ok) {
+    uint8_t frame[ARB_HDR_LEN + 3 + ARB_CRON_NAME_MAX];
+    uint32_t total;
+    if (name_len > ARB_CRON_NAME_MAX) return ARBITRO_ERR_ARG;
+    total = arb__cron_ack_encode(frame, c->next_seq++, name, name_len, ok);
+    return arb__io_send_all(c, frame, total);
+}
+
+static int arb__dispatch_cron_fire(arbitro_client_t *c,
+                                   const uint8_t *body, uint32_t body_len) {
+    uint16_t name_len;
+    const uint8_t *name;
+    arb_cron_t *slot;
+    arbitro_cron_fire_t fire;
+    int rc;
+
+    if (body_len < ARB_CRON_FIRE_FIXED) return ARBITRO_OK;
+    name_len = arb__get_u16(body);
+    if ((uint32_t)ARB_CRON_FIRE_FIXED + name_len > body_len) return ARBITRO_OK;
+    name = body + ARB_CRON_FIRE_FIXED;
+
+    slot = arb__cron_find(c, name, name_len);
+    if (!slot) return ARBITRO_OK;
+
+    fire.name         = name;
+    fire.name_len     = name_len;
+    fire.fire_time_ms = arb__get_u64(body + 2);
+    fire.fire_count   = arb__get_u64(body + 10);
+    rc = slot->cb(&fire, slot->ud);
+    return arb__send_cron_ack(c, name, name_len, rc == 0);
+}
+
+static void arb__recreate_crons(arbitro_client_t *c) {
+    int i;
+    for (i = 0; i < ARB_MAX_CRONS; i++) {
+        if (c->crons[i].active) {
+            uint8_t body[512];
+            const char *tz = c->crons[i].has_tz ? c->crons[i].tz : NULL;
+            size_t blen = arb__cron_body(body, sizeof(body),
+                                         c->crons[i].name, c->crons[i].expr, tz);
+            if (blen > 0)
+                arb__request_ok(c, ARB_ACT_CREATE_CRON, body, (uint32_t)blen, NULL);
+        }
+    }
 }
 
 static int arb__consumer_id_op(arbitro_client_t *c, const char *stream,
@@ -3527,6 +3736,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
                 c->m_reconnects++;
 
                 arb__resubscribe_all(c);
+                arb__recreate_crons(c);
                 arb_ackrel_replay(c);
 
                 if (c->default_svc) {
