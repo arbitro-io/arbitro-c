@@ -94,6 +94,11 @@ int  arbitro_publish_sync(arbitro_client_t *c, uint32_t stream_id,
                           const uint8_t *subject, uint16_t subject_len,
                           const uint8_t *payload, uint32_t payload_len,
                           uint64_t *out_seq);
+/* name-parity alias for the Rust reference client's publish_wait: waits for the broker OK, not a disk fsync */
+int  arbitro_publish_wait(arbitro_client_t *c, uint32_t stream_id,
+                          const uint8_t *subject, uint16_t subject_len,
+                          const uint8_t *payload, uint32_t payload_len,
+                          uint64_t *out_seq);
 int  arbitro_publish_with_id(arbitro_client_t *c, uint32_t stream_id,
                              const uint8_t *subject, uint16_t subject_len,
                              const uint8_t *msg_id, uint16_t msg_id_len,
