@@ -44,6 +44,9 @@ build/unit_tests: tests/unit_tests.c build/libarbitro.a | build
 build/integration: tests/integration.c build/libarbitro.a | build
 	$(CC) $(CFLAGS) $(INCLUDES) $< -Lbuild -larbitro $(LDFLAGS) -o $@
 
+build/queue_integration: tests/queue_integration.c build/libarbitro.a | build
+	$(CC) $(CFLAGS) $(INCLUDES) $< -Lbuild -larbitro $(LDFLAGS) -o $@
+
 # --- Examples ---
 
 examples: build/example_pubsub build/example_service

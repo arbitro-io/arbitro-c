@@ -74,6 +74,9 @@ if(ARBITRO_BUILD_TESTS)
 
     add_executable(integration tests/integration.c)
     target_link_libraries(integration PRIVATE arbitro)
+
+    add_executable(queue_integration tests/queue_integration.c)
+    target_link_libraries(queue_integration PRIVATE arbitro)
 endif()
 
 # --- Examples ---
