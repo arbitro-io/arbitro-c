@@ -1465,6 +1465,53 @@ int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
     return arbitro_subscribe_filter(c, stream_id, consumer_id, NULL, 0, cb, userdata);
 }
 
+int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
+                            const arbitro_queue_cfg_t *cfg,
+                            arbitro_msg_cb cb, void *userdata) {
+    arbitro_queue_cfg_t defaults;
+    arbitro_consumer_cfg_t ccfg;
+    const char *group;
+    const char *filter;
+    uint32_t stream_id = 0;
+    uint32_t consumer_id = 0;
+    size_t filter_len;
+    int rc;
+
+    if (!c || !stream || !stream[0] || !cb) return ARBITRO_ERR_ARG;
+    if (!cfg) {
+        memset(&defaults, 0, sizeof(defaults));
+        cfg = &defaults;
+    }
+
+    group = (cfg->group && cfg->group[0]) ? cfg->group : stream;
+    filter = cfg->filter;
+
+    /* name == group keeps concurrent joins idempotent: they always move
+       together, so two workers cannot disagree on the consumer config. */
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.name = group;
+    ccfg.group = group;
+    ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.deliver_mode = 1;
+    ccfg.ack_wait_ms = cfg->ack_wait_ms;
+    ccfg.max_inflight = cfg->max_inflight;
+    ccfg.deliver_policy = cfg->deliver_policy;
+
+    rc = arbitro_consumer_create(c, stream, &ccfg, &consumer_id);
+    if (rc != ARBITRO_OK) return rc;
+
+    rc = arbitro_resolve_stream_id(c, stream, &stream_id);
+    if (rc != ARBITRO_OK) return rc;
+
+    /* The subject filter belongs to the subscription, not the consumer. */
+    filter_len = filter ? strlen(filter) : 0;
+    if (filter_len > 0xFFFF) return ARBITRO_ERR_ARG;
+
+    return arbitro_subscribe_filter(c, stream_id, consumer_id,
+                                    (const uint8_t *)filter,
+                                    (uint16_t)filter_len, cb, userdata);
+}
+
 int arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id) {
     int i;
     uint8_t body[64];
