@@ -135,6 +135,12 @@ int  arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
                               arbitro_msg_cb cb, void *userdata);
 int  arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id);
 
+typedef struct {
+    const uint8_t *pattern;
+    uint16_t       pattern_len;
+    uint32_t       limit;
+} arbitro_subject_limit_t;
+
 /* Zero-initialise for defaults: group falls back to the stream name, no
    subject filter, broker-default redelivery deadline, unlimited in-flight.
    ack_policy is absent on purpose -- a work queue is always explicit-ack. */
@@ -142,9 +148,11 @@ typedef struct {
     const char *group;
     const char *filter;
     uint32_t    ack_wait_ms;
-    uint32_t    max_inflight;
+    uint32_t    max_inflight;   /* clamped to the u16 wire field */
     uint8_t     deliver_policy;
-    uint64_t    start_seq;
+    uint64_t    start_seq;      /* required when deliver_policy is ByStartSeq */
+    const arbitro_subject_limit_t *subject_limits;
+    uint32_t    subject_limit_count;
 } arbitro_queue_cfg_t;
 
 /* Joins a durable work queue: every worker calling this with the same group
@@ -188,21 +196,16 @@ typedef struct {
 } arbitro_stream_cfg_t;
 
 typedef struct {
-    const uint8_t *pattern;
-    uint16_t       pattern_len;
-    uint32_t       limit;
-} arbitro_subject_limit_t;
-
-typedef struct {
     const char *name;
     const char *filter;
     const char *group;
     int         ack_policy;
-    uint32_t    max_inflight;
+    uint32_t    max_inflight;   /* clamped to the u16 wire field */
     uint32_t    ack_wait_ms;
     uint32_t    max_deliver;
     uint8_t     deliver_policy;
     uint8_t     deliver_mode;
+    uint64_t    start_seq;      /* required when deliver_policy is ByStartSeq */
     const arbitro_subject_limit_t *subject_limits;
     uint32_t    subject_limit_count;
 } arbitro_consumer_cfg_t;

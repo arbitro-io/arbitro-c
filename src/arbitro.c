@@ -1486,6 +1486,11 @@ int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
     group = (cfg->group && cfg->group[0]) ? cfg->group : stream;
     filter = cfg->filter;
 
+    /* Validate before creating: a filter rejected afterwards would leave a
+       durable consumer behind with no subscription attached to it. */
+    filter_len = filter ? strlen(filter) : 0;
+    if (filter_len > ARBITRO_MAX_SUBJECT_LEN) return ARBITRO_ERR_ARG;
+
     /* name == group keeps concurrent joins idempotent: they always move
        together, so two workers cannot disagree on the consumer config. */
     memset(&ccfg, 0, sizeof(ccfg));
@@ -1496,6 +1501,9 @@ int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
     ccfg.ack_wait_ms = cfg->ack_wait_ms;
     ccfg.max_inflight = cfg->max_inflight;
     ccfg.deliver_policy = cfg->deliver_policy;
+    ccfg.start_seq = cfg->start_seq;
+    ccfg.subject_limits = cfg->subject_limits;
+    ccfg.subject_limit_count = cfg->subject_limit_count;
 
     rc = arbitro_consumer_create(c, stream, &ccfg, &consumer_id);
     if (rc != ARBITRO_OK) return rc;
@@ -1504,9 +1512,6 @@ int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
     if (rc != ARBITRO_OK) return rc;
 
     /* The subject filter belongs to the subscription, not the consumer. */
-    filter_len = filter ? strlen(filter) : 0;
-    if (filter_len > 0xFFFF) return ARBITRO_ERR_ARG;
-
     return arbitro_subscribe_filter(c, stream_id, consumer_id,
                                     (const uint8_t *)filter,
                                     (uint16_t)filter_len, cb, userdata);
@@ -2104,7 +2109,9 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
     arb__json_bytes(&j, (const uint8_t *)(cfg->filter ? cfg->filter : ""),
                     cfg->filter ? strlen(cfg->filter) : 0);
     arb__json_key(&j, "max_inflight");
-    arb__json_u32(&j, cfg->max_inflight);
+    /* The wire field is u16; an unclamped larger value fails serde decode
+       broker-side and surfaces as a generic InternalError with no clue. */
+    arb__json_u32(&j, cfg->max_inflight > 0xFFFF ? 0xFFFF : cfg->max_inflight);
     arb__json_key(&j, "ack_policy");
     arb__json_u32(&j, (uint32_t)cfg->ack_policy);
     arb__json_key(&j, "deliver_policy");
@@ -2114,7 +2121,7 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
     arb__json_key(&j, "ack_wait_ms");
     arb__json_u32(&j, cfg->ack_wait_ms);
     arb__json_key(&j, "start_seq");
-    arb__json_u64(&j, 0);
+    arb__json_u64(&j, cfg->start_seq);
     arb__json_key(&j, "subject_limits");
     arb__json_array_begin(&j);
     for (i = 0; i < cfg->subject_limit_count; i++) {
