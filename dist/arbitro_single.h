@@ -203,16 +203,32 @@ typedef struct {
     uint64_t    idempotency_window_ms;
 } arbitro_stream_cfg_t;
 
+/* group is never sent empty: it falls back to name, then to the stream name.
+   The broker rejects an empty group, so leaving it unset is safe but means
+   this consumer gets its own queue rather than joining a shared one.
+
+   *** BEHAVIOUR CHANGE — READ THIS IF YOU ARE UPGRADING ***
+   A zero-initialised config is now a QUEUE: members of the group share the
+   work and each message goes to exactly ONE of them. It used to be a fanout,
+   where every member received every message. This aligns the C client with
+   the TS, Go and Rust clients, all of which default to queue. Fanout is still
+   available -- set `fanout` to non-zero -- it just has to be asked for.
+
+   The old `uint8_t deliver_mode` field (0 = Fanout, 1 = Queue) was REMOVED
+   rather than re-interpreted, so any call site that set it stops compiling
+   instead of silently inverting its own semantics. Translate it as:
+       deliver_mode = 1 (Queue)  ->  drop the line, that is the default now
+       deliver_mode = 0 (Fanout) ->  fanout = 1 */
 typedef struct {
     const char *name;
     const char *filter;
     const char *group;
     int         ack_policy;
+    int         fanout;         /* 0 = shared queue (default), 1 = all members get every message */
     uint32_t    max_inflight;   /* clamped to the u16 wire field */
     uint32_t    ack_wait_ms;
     uint32_t    max_deliver;
     uint8_t     deliver_policy;
-    uint8_t     deliver_mode;
     uint64_t    start_seq;      /* required when deliver_policy is ByStartSeq */
     const arbitro_subject_limit_t *subject_limits;
     uint32_t    subject_limit_count;
@@ -1885,6 +1901,15 @@ int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
     return arbitro_subscribe_filter(c, stream_id, consumer_id, NULL, 0, cb, userdata);
 }
 
+/* Never emit an empty group: the broker rejects it, and an empty group in
+   queue mode would otherwise share one anonymous queue across every caller. */
+static const char *arb__group_or_default(const char *group, const char *name,
+                                         const char *stream) {
+    if (group && group[0]) return group;
+    if (name && name[0]) return name;
+    return stream;
+}
+
 int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
                             const arbitro_queue_cfg_t *cfg,
                             arbitro_msg_cb cb, void *userdata) {
@@ -1903,7 +1928,7 @@ int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
         cfg = &defaults;
     }
 
-    group = (cfg->group && cfg->group[0]) ? cfg->group : stream;
+    group = arb__group_or_default(cfg->group, NULL, stream);
     filter = cfg->filter;
 
     /* Validate before creating: a filter rejected afterwards would leave a
@@ -1917,7 +1942,6 @@ int arbitro_queue_subscribe(arbitro_client_t *c, const char *stream,
     ccfg.name = group;
     ccfg.group = group;
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
-    ccfg.deliver_mode = 1;
     ccfg.ack_wait_ms = cfg->ack_wait_ms;
     ccfg.max_inflight = cfg->max_inflight;
     ccfg.deliver_policy = cfg->deliver_policy;
@@ -2499,32 +2523,22 @@ int arbitro_stream_delete(arbitro_client_t *c, const char *name, int keep_data) 
 /* Consumer management (cold path)                                            */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
-int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
-                            const arbitro_consumer_cfg_t *cfg,
-                            uint32_t *out_consumer_id) {
-    uint8_t body[4096];
+static size_t arb__consumer_body(uint8_t *buf, size_t cap, uint32_t stream_id,
+                                 const char *stream,
+                                 const arbitro_consumer_cfg_t *cfg) {
     arb_json_t j;
-    size_t blen;
-    arb_pending_t *rep = NULL;
-    uint32_t stream_id;
+    const char *group;
     uint32_t i;
-    if (!c || !stream || !stream[0] || strlen(stream) >= 64) return ARBITRO_ERR_ARG;
-    if (!cfg || !cfg->name) return ARBITRO_ERR_ARG;
-    int rc;
 
-    if (!cfg || !cfg->name) return ARBITRO_ERR_ARG;
+    group = arb__group_or_default(cfg->group, cfg->name, stream);
 
-    rc = arbitro_resolve_stream_id(c, stream, &stream_id);
-    if (rc != ARBITRO_OK) return rc;
-
-    arb__json_begin(&j, body, sizeof(body));
+    arb__json_begin(&j, buf, cap);
     arb__json_key(&j, "stream_id");
     arb__json_u32(&j, stream_id);
     arb__json_key(&j, "name");
     arb__json_bytes(&j, (const uint8_t *)cfg->name, strlen(cfg->name));
     arb__json_key(&j, "group");
-    arb__json_bytes(&j, (const uint8_t *)(cfg->group ? cfg->group : ""),
-                    cfg->group ? strlen(cfg->group) : 0);
+    arb__json_bytes(&j, (const uint8_t *)group, strlen(group));
     arb__json_key(&j, "subject");
     arb__json_bytes(&j, (const uint8_t *)(cfg->filter ? cfg->filter : ""),
                     cfg->filter ? strlen(cfg->filter) : 0);
@@ -2537,7 +2551,9 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
     arb__json_key(&j, "deliver_policy");
     arb__json_u32(&j, (uint32_t)cfg->deliver_policy);
     arb__json_key(&j, "deliver_mode");
-    arb__json_u32(&j, (uint32_t)cfg->deliver_mode);
+    /* The wire keeps 0 = Fanout / 1 = Queue; the public flag is inverted so a
+       zero-initialised config means queue. */
+    arb__json_u32(&j, cfg->fanout ? 0u : 1u);
     arb__json_key(&j, "ack_wait_ms");
     arb__json_u32(&j, cfg->ack_wait_ms);
     arb__json_key(&j, "start_seq");
@@ -2554,7 +2570,25 @@ int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
         arb__json_obj_end(&j);
     }
     arb__json_array_end(&j);
-    blen = arb__json_end(&j);
+    return arb__json_end(&j);
+}
+
+int arbitro_consumer_create(arbitro_client_t *c, const char *stream,
+                            const arbitro_consumer_cfg_t *cfg,
+                            uint32_t *out_consumer_id) {
+    uint8_t body[4096];
+    size_t blen;
+    arb_pending_t *rep = NULL;
+    uint32_t stream_id;
+    int rc;
+
+    if (!c || !stream || !stream[0] || strlen(stream) >= 64) return ARBITRO_ERR_ARG;
+    if (!cfg || !cfg->name) return ARBITRO_ERR_ARG;
+
+    rc = arbitro_resolve_stream_id(c, stream, &stream_id);
+    if (rc != ARBITRO_OK) return rc;
+
+    blen = arb__consumer_body(body, sizeof(body), stream_id, stream, cfg);
     if (blen == 0) return ARBITRO_ERR_ARG;
 
     rc = arb__request_ok(c, ARB_ACT_CREATE_CONSUMER, body, (uint32_t)blen, &rep);
@@ -3974,6 +4008,36 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
     }
 }
 
+/* Queue-grouped (fanout left at 0): one RPC is handled by one instance
+   instead of by every instance of the service. */
+static void arb__svc_worker_cfg(arbitro_consumer_cfg_t *ccfg, const char *name,
+                                const char *filter, uint32_t max_inflight) {
+    memset(ccfg, 0, sizeof(*ccfg));
+    ccfg->name = name;
+    ccfg->filter = filter;
+    ccfg->group = name;
+    ccfg->ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg->max_inflight = max_inflight;
+    ccfg->ack_wait_ms = 30000;
+}
+
+/* Fanout on purpose: instance_id is a process-local counter, so two processes
+   can collide on the same reply name. Fanout degrades to "you also see a
+   sibling's reply and drop it" (no waiter matches the correlation id); a queue
+   would let a sibling steal it. */
+static void arb__svc_reply_cfg(arbitro_consumer_cfg_t *ccfg, const char *name,
+                               const char *filter, uint32_t max_inflight) {
+    memset(ccfg, 0, sizeof(*ccfg));
+    ccfg->name = name;
+    ccfg->filter = filter;
+    ccfg->group = name;
+    ccfg->ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg->fanout = 1;
+    ccfg->max_inflight = max_inflight;
+    ccfg->ack_wait_ms = 30000;
+    ccfg->deliver_policy = 1;
+}
+
 int arbitro_service_create(arbitro_client_t *c, const char *name,
                            uint32_t max_inflight,
                            arbitro_service_t **out_svc) {
@@ -4009,25 +4073,11 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     rc = arbitro_stream_upsert(c, stream_name, &scfg, &svc->stream_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    /* Worker consumer: queue-grouped, handles method calls only. */
-    ccfg.name = worker_name;
-    ccfg.filter = worker_filter;
-    ccfg.group = worker_name;
-    ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
-    ccfg.max_inflight = max_inflight;
-    ccfg.ack_wait_ms = 30000;
+    arb__svc_worker_cfg(&ccfg, worker_name, worker_filter, max_inflight);
     rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->worker_consumer_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    /* Reply consumer: per-instance, NO group — replies MUST NOT
-       load-balance to sibling instances. Deliver only new replies. */
-    memset(&ccfg, 0, sizeof(ccfg));
-    ccfg.name = reply_name;
-    ccfg.filter = reply_filter;
-    ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
-    ccfg.max_inflight = max_inflight;
-    ccfg.ack_wait_ms = 30000;
-    ccfg.deliver_policy = 1; /* New */
+    arb__svc_reply_cfg(&ccfg, reply_name, reply_filter, max_inflight);
     rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->reply_consumer_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 

@@ -303,7 +303,7 @@ static void t_group_consumers_load_balance(void) {
     ccfg.name="workers"; ccfg.filter=">"; ccfg.group="workers";
     ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
-    ccfg.deliver_mode = 1; /* Queue */
+    ccfg.fanout = 0; /* Queue (the default) */
     arbitro_consumer_upsert(ca, n, &ccfg, &cid_a);
     arbitro_consumer_upsert(cb, n, &ccfg, &cid_b);
     arbitro_consumer_upsert(cc, n, &ccfg, &cid_c);
@@ -346,7 +346,7 @@ static void t_fanout_mode(void) {
     arbitro_stream_upsert(cc, n, &scfg, &sid_c);
     ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=200; ccfg.ack_wait_ms=30000;
-    ccfg.deliver_mode = 0; /* Fanout */
+    ccfg.fanout = 1; /* Fanout */
     ccfg.name="fA"; arbitro_consumer_create(ca, n, &ccfg, &cid_a);
     ccfg.name="fB"; arbitro_consumer_create(cb, n, &ccfg, &cid_b);
     ccfg.name="fC"; arbitro_consumer_create(cc, n, &ccfg, &cid_c);

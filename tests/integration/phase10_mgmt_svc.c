@@ -283,7 +283,7 @@ static void test_create_consumer_all_config(void) {
     ccfg.ack_wait_ms = 5000;
     ccfg.max_deliver = 3;
     ccfg.deliver_policy = 0;
-    ccfg.deliver_mode = 0;
+    ccfg.fanout = 1;
     int rc = arbitro_consumer_create(c, n, &ccfg, &cid);
     if (rc != 0 || cid == 0) { FAIL("create rc=%d cid=%u", rc, cid); arbitro_client_close(c); return; }
     arbitro_consumer_info_t info = {0};

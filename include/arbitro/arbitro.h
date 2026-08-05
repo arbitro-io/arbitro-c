@@ -195,16 +195,32 @@ typedef struct {
     uint64_t    idempotency_window_ms;
 } arbitro_stream_cfg_t;
 
+/* group is never sent empty: it falls back to name, then to the stream name.
+   The broker rejects an empty group, so leaving it unset is safe but means
+   this consumer gets its own queue rather than joining a shared one.
+
+   *** BEHAVIOUR CHANGE — READ THIS IF YOU ARE UPGRADING ***
+   A zero-initialised config is now a QUEUE: members of the group share the
+   work and each message goes to exactly ONE of them. It used to be a fanout,
+   where every member received every message. This aligns the C client with
+   the TS, Go and Rust clients, all of which default to queue. Fanout is still
+   available -- set `fanout` to non-zero -- it just has to be asked for.
+
+   The old `uint8_t deliver_mode` field (0 = Fanout, 1 = Queue) was REMOVED
+   rather than re-interpreted, so any call site that set it stops compiling
+   instead of silently inverting its own semantics. Translate it as:
+       deliver_mode = 1 (Queue)  ->  drop the line, that is the default now
+       deliver_mode = 0 (Fanout) ->  fanout = 1 */
 typedef struct {
     const char *name;
     const char *filter;
     const char *group;
     int         ack_policy;
+    int         fanout;         /* 0 = shared queue (default), 1 = all members get every message */
     uint32_t    max_inflight;   /* clamped to the u16 wire field */
     uint32_t    ack_wait_ms;
     uint32_t    max_deliver;
     uint8_t     deliver_policy;
-    uint8_t     deliver_mode;
     uint64_t    start_seq;      /* required when deliver_policy is ByStartSeq */
     const arbitro_subject_limit_t *subject_limits;
     uint32_t    subject_limit_count;

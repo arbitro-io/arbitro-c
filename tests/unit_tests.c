@@ -664,6 +664,141 @@ ARB_TEST(test_cron_fire_dispatch_truncated) {
     ARB_PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* Consumer group defaulting (group -> name -> stream)                        */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+static void arb__test_group_json(const char *s, char *out, size_t cap) {
+    size_t i, len = strlen(s);
+    int n = snprintf(out, cap, "\"group\":[");
+    for (i = 0; i < len; i++)
+        n += snprintf(out + n, cap - (size_t)n, i ? ",%u" : "%u",
+                      (unsigned)(unsigned char)s[i]);
+    snprintf(out + n, cap - (size_t)n, "]");
+}
+
+static int arb__test_body_has_group(const arbitro_consumer_cfg_t *cfg,
+                                    const char *stream, const char *expect) {
+    uint8_t body[4096];
+    char text[4097];
+    char want[512];
+    size_t blen = arb__consumer_body(body, sizeof(body), 7, stream, cfg);
+    if (blen == 0) return 0;
+    memcpy(text, body, blen);
+    text[blen] = '\0';
+    arb__test_group_json(expect, want, sizeof(want));
+    return strstr(text, want) != NULL;
+}
+
+ARB_TEST(test_group_default_helper) {
+    ARB_ASSERT(strcmp(arb__group_or_default("g", "n", "s"), "g") == 0);
+    ARB_ASSERT(strcmp(arb__group_or_default("", "n", "s"), "n") == 0);
+    ARB_ASSERT(strcmp(arb__group_or_default(NULL, "n", "s"), "n") == 0);
+    ARB_ASSERT(strcmp(arb__group_or_default(NULL, "", "s"), "s") == 0);
+    ARB_ASSERT(strcmp(arb__group_or_default(NULL, NULL, "s"), "s") == 0);
+    ARB_PASS();
+}
+
+ARB_TEST(test_consumer_body_group_explicit_wins) {
+    arbitro_consumer_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "worker-1";
+    cfg.group = "workers";
+    ARB_ASSERT(arb__test_body_has_group(&cfg, "orders", "workers"));
+    ARB_PASS();
+}
+
+ARB_TEST(test_consumer_body_group_falls_back_to_name) {
+    arbitro_consumer_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "worker-1";
+    ARB_ASSERT(arb__test_body_has_group(&cfg, "orders", "worker-1"));
+    cfg.group = "";
+    ARB_ASSERT(arb__test_body_has_group(&cfg, "orders", "worker-1"));
+    ARB_PASS();
+}
+
+ARB_TEST(test_consumer_body_group_falls_back_to_stream) {
+    arbitro_consumer_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "";
+    ARB_ASSERT(arb__test_body_has_group(&cfg, "orders", "orders"));
+    ARB_PASS();
+}
+
+ARB_TEST(test_consumer_body_group_never_empty) {
+    arbitro_consumer_cfg_t cfg;
+    uint8_t body[4096];
+    char text[4097];
+    size_t blen;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "";
+    cfg.group = "";
+    blen = arb__consumer_body(body, sizeof(body), 7, "orders", &cfg);
+    ARB_ASSERT(blen > 0);
+    memcpy(text, body, blen);
+    text[blen] = '\0';
+    ARB_ASSERT(strstr(text, "\"group\":[]") == NULL);
+    ARB_PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* deliver_mode defaulting (zero-init means Queue, fanout is opt-in)           */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+static int arb__test_deliver_mode(const arbitro_consumer_cfg_t *cfg,
+                                  const char *stream) {
+    uint8_t body[4096];
+    char text[4097];
+    const char *p;
+    size_t blen = arb__consumer_body(body, sizeof(body), 7, stream, cfg);
+    if (blen == 0) return -1;
+    memcpy(text, body, blen);
+    text[blen] = '\0';
+    p = strstr(text, "\"deliver_mode\":");
+    if (!p) return -1;
+    p += strlen("\"deliver_mode\":");
+    if (*p < '0' || *p > '9') return -1;
+    return *p - '0';
+}
+
+ARB_TEST(test_consumer_body_defaults_to_queue) {
+    arbitro_consumer_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "worker-1";
+    ARB_ASSERT_EQ(arb__test_deliver_mode(&cfg, "orders"), 1);
+    ARB_PASS();
+}
+
+ARB_TEST(test_consumer_body_fanout_is_opt_in) {
+    arbitro_consumer_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.name = "watcher-1";
+    cfg.fanout = 1;
+    ARB_ASSERT_EQ(arb__test_deliver_mode(&cfg, "orders"), 0);
+    cfg.fanout = 42;
+    ARB_ASSERT_EQ(arb__test_deliver_mode(&cfg, "orders"), 0);
+    ARB_PASS();
+}
+
+ARB_TEST(test_service_worker_is_queue_reply_is_fanout) {
+    arbitro_consumer_cfg_t worker;
+    arbitro_consumer_cfg_t reply;
+
+    arb__svc_worker_cfg(&worker, "_svc-a-worker", "_svc.a.m.>", 64);
+    arb__svc_reply_cfg(&reply, "_svc-a-reply-1", "_svc.a._r.1.>", 64);
+
+    ARB_ASSERT_EQ(worker.fanout, 0);
+    ARB_ASSERT_EQ(arb__test_deliver_mode(&worker, "_svc-a"), 1);
+
+    /* Replies must stay per-instance: a shared queue would let a sibling
+       instance steal a reply this instance is waiting on. */
+    ARB_ASSERT_EQ(reply.fanout, 1);
+    ARB_ASSERT_EQ(arb__test_deliver_mode(&reply, "_svc-a"), 0);
+    ARB_ASSERT_EQ(strcmp(reply.group, "_svc-a-reply-1"), 0);
+    ARB_PASS();
+}
+
 int main(void) {
     fprintf(stdout, "arbitro-c unit tests\n");
     ARB_RUN_TESTS();
