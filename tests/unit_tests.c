@@ -785,11 +785,17 @@ ARB_TEST(test_service_worker_is_queue_reply_is_fanout) {
     arbitro_consumer_cfg_t worker;
     arbitro_consumer_cfg_t reply;
 
-    arb__svc_worker_cfg(&worker, "_svc-a-worker", "_svc.a.m.>", 64);
+    arb__svc_worker_cfg(&worker, "_svc-a-worker-1", "_svc-a-worker",
+                        "_svc.a.m.>", 64);
     arb__svc_reply_cfg(&reply, "_svc-a-reply-1", "_svc.a._r.1.>", 64);
 
     ARB_ASSERT_EQ(worker.fanout, 0);
     ARB_ASSERT_EQ(arb__test_deliver_mode(&worker, "_svc-a"), 1);
+
+    /* Per-instance name, service-wide group: sharing the name collapses every
+       instance onto one consumer id and only the last to subscribe is fed. */
+    ARB_ASSERT_EQ(strcmp(worker.name, "_svc-a-worker-1"), 0);
+    ARB_ASSERT_EQ(strcmp(worker.group, "_svc-a-worker"), 0);
 
     /* Replies must stay per-instance: a shared queue would let a sibling
        instance steal a reply this instance is waiting on. */

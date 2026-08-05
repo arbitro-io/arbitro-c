@@ -47,6 +47,10 @@ build/integration: tests/integration.c build/libarbitro.a | build
 build/queue_integration: tests/queue_integration.c build/libarbitro.a | build
 	$(CC) $(CFLAGS) $(INCLUDES) $< -Lbuild -larbitro $(LDFLAGS) -o $@
 
+# Needs threads: two service instances must be pumped while the caller blocks.
+build/service_integration: tests/service_integration.c build/libarbitro.a | build
+	$(CC) $(CFLAGS) $(INCLUDES) $< -Lbuild -larbitro $(LDFLAGS) -lpthread -o $@
+
 # --- Examples ---
 
 examples: build/example_pubsub build/example_service

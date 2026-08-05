@@ -77,6 +77,12 @@ if(ARBITRO_BUILD_TESTS)
 
     add_executable(queue_integration tests/queue_integration.c)
     target_link_libraries(queue_integration PRIVATE arbitro)
+
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+        add_executable(service_integration tests/service_integration.c)
+        target_link_libraries(service_integration PRIVATE arbitro Threads::Threads)
+    endif()
 endif()
 
 # --- Examples ---

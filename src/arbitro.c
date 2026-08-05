@@ -3573,13 +3573,17 @@ static void arb__svc_dispatch(arbitro_msg_t *msg, void *ud) {
 }
 
 /* Queue-grouped (fanout left at 0): one RPC is handled by one instance
-   instead of by every instance of the service. */
+   instead of by every instance of the service. The NAME must be per-instance
+   and the GROUP service-wide -- a shared name collapses every instance onto
+   one consumer id, and the broker allows one subscription per id, so each
+   instance that starts retires the previous one's binding. */
 static void arb__svc_worker_cfg(arbitro_consumer_cfg_t *ccfg, const char *name,
-                                const char *filter, uint32_t max_inflight) {
+                                const char *group, const char *filter,
+                                uint32_t max_inflight) {
     memset(ccfg, 0, sizeof(*ccfg));
     ccfg->name = name;
     ccfg->filter = filter;
-    ccfg->group = name;
+    ccfg->group = group;
     ccfg->ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg->max_inflight = max_inflight;
     ccfg->ack_wait_ms = 30000;
@@ -3611,7 +3615,8 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     char stream_name[128];
     char stream_filter[128];
     char worker_filter[128];
-    char worker_name[128];
+    char worker_group[160];
+    char worker_name[160];
     char reply_filter[160];
     char reply_name[160];
     int rc;
@@ -3626,7 +3631,9 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     snprintf(stream_name,    sizeof(stream_name),    "_svc-%s", name);
     snprintf(stream_filter,  sizeof(stream_filter),  "_svc.%s.>", name);
     snprintf(worker_filter,  sizeof(worker_filter),  "_svc.%s.m.>", name);
-    snprintf(worker_name,    sizeof(worker_name),    "_svc-%s-worker", name);
+    snprintf(worker_group,   sizeof(worker_group),   "_svc-%s-worker", name);
+    snprintf(worker_name,    sizeof(worker_name),    "_svc-%s-worker-%u",
+             name, (unsigned)svc->instance_id);
     snprintf(reply_filter,   sizeof(reply_filter),   "_svc.%s._r.%u.>",
              name, (unsigned)svc->instance_id);
     snprintf(reply_name,     sizeof(reply_name),     "_svc-%s-reply-%u",
@@ -3637,7 +3644,8 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     rc = arbitro_stream_upsert(c, stream_name, &scfg, &svc->stream_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    arb__svc_worker_cfg(&ccfg, worker_name, worker_filter, max_inflight);
+    arb__svc_worker_cfg(&ccfg, worker_name, worker_group, worker_filter,
+                        max_inflight);
     rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->worker_consumer_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
@@ -3645,11 +3653,18 @@ int arbitro_service_create(arbitro_client_t *c, const char *name,
     rc = arbitro_consumer_upsert(c, stream_name, &ccfg, &svc->reply_consumer_id);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
 
-    rc = arbitro_subscribe(c, svc->stream_id, svc->worker_consumer_id,
-                           arb__svc_dispatch, svc);
+    /* Each subscription must carry its consumer's filter: the broker treats
+       an empty filter list as catch-all, which would hand the reply consumer
+       the method calls too and run every handler twice. */
+    rc = arbitro_subscribe_filter(c, svc->stream_id, svc->worker_consumer_id,
+                                  (const uint8_t *)worker_filter,
+                                  (uint16_t)strlen(worker_filter),
+                                  arb__svc_dispatch, svc);
     if (rc != ARBITRO_OK) { free(svc); return rc; }
-    rc = arbitro_subscribe(c, svc->stream_id, svc->reply_consumer_id,
-                           arb__svc_dispatch, svc);
+    rc = arbitro_subscribe_filter(c, svc->stream_id, svc->reply_consumer_id,
+                                  (const uint8_t *)reply_filter,
+                                  (uint16_t)strlen(reply_filter),
+                                  arb__svc_dispatch, svc);
     if (rc != ARBITRO_OK) {
         arbitro_unsubscribe(c, svc->worker_consumer_id);
         free(svc);
