@@ -83,6 +83,19 @@ if(ARBITRO_BUILD_TESTS)
         add_executable(service_integration tests/service_integration.c)
         target_link_libraries(service_integration PRIVATE arbitro Threads::Threads)
     endif()
+
+    # tests/integration/ — one executable per file, each with its own main.
+    # These existed but were never referenced here, so ~85 test cases had
+    # never been compiled, let alone run. They all still build clean against
+    # the current API; the only thing missing was the wiring.
+    file(GLOB ARBITRO_PHASE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/*.c)
+    foreach(phase_src ${ARBITRO_PHASE_TESTS})
+        get_filename_component(phase_name ${phase_src} NAME_WE)
+        add_executable(${phase_name} ${phase_src})
+        target_include_directories(${phase_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(${phase_name} PRIVATE arbitro)
+        add_test(NAME ${phase_name} COMMAND ${phase_name})
+    endforeach()
 endif()
 
 # --- Examples ---
