@@ -541,7 +541,11 @@ ARB_TEST(test_opts_defaults) {
     ARB_ASSERT_EQ(opts.request_timeout_ms, 5000u);
     ARB_ASSERT_EQ(opts.frame_buf_size, (uint32_t)ARBITRO_DEFAULT_FRAME_BUF);
     ARB_ASSERT_EQ(opts.reconnect, 0);
-    ARB_ASSERT_EQ(opts.reconnect_max, 10u);
+    /* 0 = retry forever, matching arbitro-client-tokio's ReconnectPolicy
+       default (max_attempts: None). A finite default silently abandons a
+       client after a long outage, which is the failure mode reconnect exists
+       to prevent. */
+    ARB_ASSERT_EQ(opts.reconnect_max, 0u);
     ARB_ASSERT_EQ(opts.reconnect_delay_ms, 500u);
     ARB_PASS();
 }
