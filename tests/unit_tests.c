@@ -809,6 +809,99 @@ ARB_TEST(test_service_worker_is_queue_reply_is_fanout) {
     ARB_PASS();
 }
 
+/* A RepBatch entry declares subject_len, reply_len and data_len separately,
+   and data_len spans all three sections. Nothing stops a peer from sending
+   lengths that do not agree. These feed the dispatcher bodies that a hostile
+   or buggy broker could send and require it to reject rather than compute a
+   view outside the buffer — the failure that showed up as a SEGV in
+   arb__replyto_decode once the integration tests were finally built. */
+
+static void arb__test_never_called(arbitro_msg_t *msg, void *ud) {
+    (void)msg;
+    *(int *)ud = 1;
+}
+
+static void arb__test_add_sub(arbitro_client_t *c, uint32_t consumer_id,
+                              arbitro_msg_cb cb, void *ud) {
+    c->subs[0].active      = 1;
+    c->subs[0].consumer_id = consumer_id;
+    c->subs[0].cb          = cb;
+    c->subs[0].ud          = ud;
+}
+
+static void arb__batch_entry(uint8_t *e, uint32_t consumer_id,
+                             uint16_t subject_len, uint16_t reply_len,
+                             uint32_t data_len) {
+    arb__put_u32(e + 0, consumer_id);
+    arb__put_u64(e + 4, 1);
+    arb__put_u16(e + 12, subject_len);
+    arb__put_u16(e + 14, reply_len);
+    arb__put_u32(e + 16, data_len);
+    arb__put_u32(e + 20, 0);
+}
+
+ARB_TEST(test_batch_rejects_lengths_exceeding_data_len) {
+    uint8_t body[128];
+    int called = 0;
+    arbitro_client_t *c = arb__test_make_client();
+    if (!c) { ARB_ASSERT(0); }
+    arb__test_add_sub(c, 7, arb__test_never_called, &called);
+
+    memset(body, 0, sizeof(body));
+    arb__put_u16(body, 1);
+    /* subject 40 + reply 40 = 80 against data_len 16: the old code computed
+       16 - 80 as unsigned and handed the callback a ~4 GB payload. */
+    arb__batch_entry(body + 4, 7, 40, 40, 16);
+
+    ARB_ASSERT_EQ(arb__dispatch_batch_body(c, body, 4 + 24 + 16),
+                  ARBITRO_ERR_PROTOCOL);
+    ARB_ASSERT_EQ(called, 0);
+
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
+ARB_TEST(test_batch_rejects_data_len_overflowing_u32) {
+    uint8_t body[128];
+    int called = 0;
+    arbitro_client_t *c = arb__test_make_client();
+    if (!c) { ARB_ASSERT(0); }
+    arb__test_add_sub(c, 7, arb__test_never_called, &called);
+
+    memset(body, 0, sizeof(body));
+    arb__put_u16(body, 1);
+    /* 24 + 0xFFFFFFF8 wraps to 16 in 32-bit arithmetic, so the bounds check
+       used to pass and `off` advanced into the middle of nothing. */
+    arb__batch_entry(body + 4, 7, 0, 0, 0xFFFFFFF8u);
+
+    ARB_ASSERT_EQ(arb__dispatch_batch_body(c, body, sizeof(body)),
+                  ARBITRO_ERR_PROTOCOL);
+    ARB_ASSERT_EQ(called, 0);
+
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
+ARB_TEST(test_batch_accepts_well_formed_entry) {
+    uint8_t body[128];
+    int called = 0;
+    arbitro_client_t *c = arb__test_make_client();
+    if (!c) { ARB_ASSERT(0); }
+    arb__test_add_sub(c, 7, arb__test_never_called, &called);
+
+    memset(body, 0, sizeof(body));
+    arb__put_u16(body, 1);
+    /* subject 4 + reply 0 + payload 8 = data_len 12 — the guard must not
+       reject the shape it exists to protect. */
+    arb__batch_entry(body + 4, 7, 4, 0, 12);
+
+    ARB_ASSERT_EQ(arb__dispatch_batch_body(c, body, 4 + 24 + 12), ARBITRO_OK);
+    ARB_ASSERT_EQ(called, 1);
+
+    arb__test_free_client(c);
+    ARB_PASS();
+}
+
 int main(void) {
     fprintf(stdout, "arbitro-c unit tests\n");
     ARB_RUN_TESTS();

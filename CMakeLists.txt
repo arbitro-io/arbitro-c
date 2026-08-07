@@ -96,6 +96,26 @@ if(ARBITRO_BUILD_TESTS)
         target_link_libraries(${phase_name} PRIVATE arbitro)
         add_test(NAME ${phase_name} COMMAND ${phase_name})
     endforeach()
+
+    # C only warns when a function pointer of the wrong shape is passed, so a
+    # handler written against an older signature compiles and then reads one
+    # struct at another's offsets at runtime. That is exactly how the SEGV in
+    # arb__replyto_decode got in. Make it a hard error everywhere tests are
+    # built — a callback mismatch must never reach a broker again.
+    foreach(t IN LISTS ARBITRO_PHASE_TESTS)
+        get_filename_component(tn ${t} NAME_WE)
+        target_compile_options(${tn} PRIVATE
+            -Werror=incompatible-pointer-types
+            -Werror=implicit-function-declaration)
+        # These tests call usleep(), which glibc hides under the strict C99
+        # the library itself is built with.
+        target_compile_definitions(${tn} PRIVATE _DEFAULT_SOURCE)
+    endforeach()
+    foreach(tn unit_tests integration queue_integration)
+        target_compile_options(${tn} PRIVATE
+            -Werror=incompatible-pointer-types
+            -Werror=implicit-function-declaration)
+    endforeach()
 endif()
 
 # --- Examples ---

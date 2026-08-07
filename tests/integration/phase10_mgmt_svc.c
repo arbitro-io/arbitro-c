@@ -391,9 +391,18 @@ static void test_consumer_stats_pending(void) {
 /* ─────────────────────────────────────────────────────────────────────── */
 
 /* Test 19: basic request/reply */
-static void on_echo(arbitro_msg_t *m, void *ud) {
-    (void)ud;
-    arbitro_msg_reply(m, (const uint8_t*)"ok", 2);
+/* Handlers fill out_buf and return; the framework replies and acks exactly
+   once. These were written against the pre-auto-ack signature and called
+   arbitro_msg_reply on what the framework actually passes — an
+   arbitro_request_t read at arbitro_msg_t offsets, which is how a garbage
+   reply_to reached arb__replyto_decode and segfaulted. */
+static int on_echo(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                   uint32_t *out_len, void *ud) {
+    (void)req; (void)ud;
+    if (cap < 2) return ARBITRO_ERR_TOOLARGE;
+    memcpy(out, "ok", 2);
+    *out_len = 2;
+    return ARBITRO_OK;
 }
 static volatile int echo_svc_ready = 0;
 static char echo_svc_name[64];
@@ -458,9 +467,24 @@ static void test_request_timeout_slot_leak(void) {
 }
 
 /* Test 22: multiple handlers on one service */
-static void on_add(arbitro_msg_t *m, void *ud) { (void)ud; arbitro_msg_reply(m, (const uint8_t*)"A", 1); }
-static void on_sub(arbitro_msg_t *m, void *ud) { (void)ud; arbitro_msg_reply(m, (const uint8_t*)"S", 1); }
-static void on_mul(arbitro_msg_t *m, void *ud) { (void)ud; arbitro_msg_reply(m, (const uint8_t*)"M", 1); }
+static int arb__reply_byte(uint8_t *out, uint32_t cap, uint32_t *out_len, char b) {
+    if (cap < 1) return ARBITRO_ERR_TOOLARGE;
+    out[0] = (uint8_t)b;
+    *out_len = 1;
+    return ARBITRO_OK;
+}
+static int on_add(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                  uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; return arb__reply_byte(out, cap, out_len, 'A');
+}
+static int on_sub(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                  uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; return arb__reply_byte(out, cap, out_len, 'S');
+}
+static int on_mul(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                  uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; return arb__reply_byte(out, cap, out_len, 'M');
+}
 static volatile int calc_ready = 0;
 static char calc_svc_name[64];
 static void *calc_svc_thread(void *arg) {
@@ -499,7 +523,14 @@ static void test_service_multiple_handlers(void) {
 /* Test 23: two clients — one hosts, other requests */
 static volatile int host2_ready = 0;
 static char host2_name[64];
-static void on_ping(arbitro_msg_t *m, void *ud) { (void)ud; arbitro_msg_reply(m, (const uint8_t*)"pong", 4); }
+static int on_ping(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                   uint32_t *out_len, void *ud) {
+    (void)req; (void)ud;
+    if (cap < 4) return ARBITRO_ERR_TOOLARGE;
+    memcpy(out, "pong", 4);
+    *out_len = 4;
+    return ARBITRO_OK;
+}
 static void *host2_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
@@ -533,8 +564,13 @@ static void test_service_two_clients(void) {
 static volatile int notify_hits = 0;
 static volatile int notify_ready = 0;
 static char notify_name[64];
-static void on_notify(arbitro_msg_t *m, void *ud) {
-    (void)ud; notify_hits++; arbitro_msg_ack(m);
+/* Fire-and-forget: no reply body, so the framework acks and sends nothing. */
+static int on_notify(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                     uint32_t *out_len, void *ud) {
+    (void)req; (void)out; (void)cap; (void)ud;
+    notify_hits++;
+    *out_len = 0;
+    return ARBITRO_OK;
 }
 static void *notify_thread(void *arg) {
     (void)arg;
@@ -592,8 +628,20 @@ static void test_service_send_no_reply(void) {
 static volatile int con_a_hits = 0, con_b_hits = 0;
 static volatile int con_ready_a = 0, con_ready_b = 0;
 static char con_svc_a[64], con_svc_b[64];
-static void on_con_a(arbitro_msg_t *m, void *ud) { (void)ud; con_a_hits++; arbitro_msg_reply(m,(const uint8_t*)"AA",2); }
-static void on_con_b(arbitro_msg_t *m, void *ud) { (void)ud; con_b_hits++; arbitro_msg_reply(m,(const uint8_t*)"BB",2); }
+static int arb__reply_2(uint8_t *out, uint32_t cap, uint32_t *out_len, const char *s2) {
+    if (cap < 2) return ARBITRO_ERR_TOOLARGE;
+    memcpy(out, s2, 2);
+    *out_len = 2;
+    return ARBITRO_OK;
+}
+static int on_con_a(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                    uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; con_a_hits++; return arb__reply_2(out, cap, out_len, "AA");
+}
+static int on_con_b(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                    uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; con_b_hits++; return arb__reply_2(out, cap, out_len, "BB");
+}
 static void *con_host_a(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
@@ -656,7 +704,13 @@ static void test_two_clients_concurrent_requests(void) {
 }
 
 /* Test 27: handler doesn't reply → timeout */
-static void on_silent(arbitro_msg_t *m, void *ud) { (void)m; (void)ud; /* no reply */ arbitro_msg_ack(m); }
+/* Deliberately produces no reply body: the framework acks and sends nothing. */
+static int on_silent(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                     uint32_t *out_len, void *ud) {
+    (void)req; (void)out; (void)cap; (void)ud;
+    *out_len = 0;
+    return ARBITRO_OK;
+}
 static volatile int silent_ready = 0;
 static char silent_name[64];
 static void *silent_thread(void *arg) {

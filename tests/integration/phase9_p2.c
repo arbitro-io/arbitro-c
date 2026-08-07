@@ -66,10 +66,13 @@ static void test_sync_with_id(void) {
 
 /* ─ Test 16: service_send arrives at handler ─────────────────────────── */
 static volatile int svc_send_hits = 0;
-static void on_send(arbitro_msg_t *m, void *ud) {
-    (void)m; (void)ud;
+/* Fire-and-forget: no reply body, so the framework acks and sends nothing. */
+static int on_send(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                   uint32_t *out_len, void *ud) {
+    (void)req; (void)out; (void)cap; (void)ud;
     svc_send_hits++;
-    arbitro_msg_ack(m);
+    *out_len = 0;
+    return ARBITRO_OK;
 }
 static void *send_svc_thread(void *arg) {
     arbitro_client_t *sc; arbitro_service_t *svc; (void)arg;
@@ -125,15 +128,19 @@ static void test_request_timeout_slot_leak(void) {
 
 /* ─ Test 19: two clients concurrent requests (each has its own waiters) */
 static volatile int calc_a_hits = 0, calc_b_hits = 0;
-static void on_calc_a(arbitro_msg_t *m, void *ud) {
-    (void)ud;
-    calc_a_hits++;
-    arbitro_msg_reply(m, (const uint8_t*)"AAA", 3);
+static int arb__reply_3(uint8_t *out, uint32_t cap, uint32_t *out_len, const char *s3) {
+    if (cap < 3) return ARBITRO_ERR_TOOLARGE;
+    memcpy(out, s3, 3);
+    *out_len = 3;
+    return ARBITRO_OK;
 }
-static void on_calc_b(arbitro_msg_t *m, void *ud) {
-    (void)ud;
-    calc_b_hits++;
-    arbitro_msg_reply(m, (const uint8_t*)"BBB", 3);
+static int on_calc_a(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                     uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; calc_a_hits++; return arb__reply_3(out, cap, out_len, "AAA");
+}
+static int on_calc_b(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
+                     uint32_t *out_len, void *ud) {
+    (void)req; (void)ud; calc_b_hits++; return arb__reply_3(out, cap, out_len, "BBB");
 }
 static void *host_calc_a(void *arg) {
     arbitro_client_t *sc; arbitro_service_t *svc; (void)arg;

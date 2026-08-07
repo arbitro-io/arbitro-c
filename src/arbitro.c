@@ -1905,11 +1905,11 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
         uint32_t consumer_id, data_len, subject_hash;
         uint16_t subject_len, reply_len;
         uint64_t seq;
-        uint32_t entry_size;
+        uint64_t entry_end;
         arbitro_msg_cb cb;
         void *ud;
 
-        if (off + 24 > body_len) return ARBITRO_ERR_PROTOCOL;
+        if ((uint64_t)off + 24u > (uint64_t)body_len) return ARBITRO_ERR_PROTOCOL;
 
         consumer_id  = arb__get_u32(body + off);
         seq          = arb__get_u64(body + off + 4);
@@ -1918,8 +1918,18 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
         data_len     = arb__get_u32(body + off + 16);
         subject_hash = arb__get_u32(body + off + 20);
 
-        entry_size = 24 + data_len;
-        if (off + entry_size > body_len) return ARBITRO_ERR_PROTOCOL;
+        /* 64-bit on purpose: data_len is a u32 straight off the wire, and
+           24 + data_len wraps in 32 bits, so a bogus length passes the bounds
+           check and then desyncs every later entry in the batch. */
+        entry_end = (uint64_t)off + 24u + (uint64_t)data_len;
+        if (entry_end > (uint64_t)body_len) return ARBITRO_ERR_PROTOCOL;
+
+        /* data_len spans subject + reply_to + payload (arbitro-proto
+           demux.rs:163 rejects the same case). Without this the subtraction
+           below underflows to a multi-gigabyte data_len and the callback gets
+           pointers far past the read buffer. */
+        if ((uint32_t)subject_len + (uint32_t)reply_len > data_len)
+            return ARBITRO_ERR_PROTOCOL;
 
         if (arb__find_sub(c, consumer_id, &cb, &ud)) {
             arbitro_msg_t msg;
@@ -1937,7 +1947,7 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
             cb(&msg, ud);
         }
 
-        off += entry_size;
+        off = (uint32_t)entry_end;
     }
     return ARBITRO_OK;
 }
