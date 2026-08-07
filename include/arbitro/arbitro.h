@@ -219,6 +219,14 @@ typedef struct {
     int         fanout;         /* 0 = shared queue (default), 1 = all members get every message */
     uint32_t    max_inflight;   /* clamped to the u16 wire field */
     uint32_t    ack_wait_ms;
+    /* RESERVED — not on the wire, has no effect.
+       No client (Rust, Go, TS, C) serialises a delivery cap: the
+       CreateConsumer body carries exactly 11 fields and this is not one
+       of them. The broker's nearest primitive, `max_nack`, counts only
+       nack-driven redeliveries (never ack_wait timeouts) and is itself
+       inert — exceeding it redelivers instead of dropping, because the
+       broker-native DLQ is not implemented. Kept only so existing
+       callers still compile; setting it is a no-op. */
     uint32_t    max_deliver;
     uint8_t     deliver_policy;
     uint64_t    start_seq;      /* required when deliver_policy is ByStartSeq */
