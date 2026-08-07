@@ -3729,14 +3729,24 @@ int arbitro_service_send(arbitro_service_t *svc,
                          const char *target, const char *method,
                          const uint8_t *payload, uint32_t len) {
     uint8_t subject[256];
+    int written;
     uint32_t subj_len;
     uint32_t stream_id;
     char stream_name[128];
     int rc;
 
-    subj_len = (uint32_t)snprintf((char *)subject, sizeof(subject),
-                                  "_svc.%s.%s", target, method);
-    snprintf(stream_name, sizeof(stream_name), "_svc-%s", target);
+    if (!svc || !target || !method) return ARBITRO_ERR_ARG;
+
+    /* `.m.` is what the worker consumer filters on (`_svc.<name>.m.>`). */
+    written = snprintf((char *)subject, sizeof(subject),
+                       "_svc.%s.m.%s", target, method);
+    if (written < 0 || (size_t)written >= sizeof(subject))
+        return ARBITRO_ERR_ARG;
+    subj_len = (uint32_t)written;
+
+    if (snprintf(stream_name, sizeof(stream_name), "_svc-%s", target)
+        >= (int)sizeof(stream_name))
+        return ARBITRO_ERR_ARG;
 
     rc = arbitro_resolve_stream_id(svc->client, stream_name, &stream_id);
     if (rc != ARBITRO_OK) return rc;

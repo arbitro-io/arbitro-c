@@ -8,6 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0;
 #define T(name) do { total++; printf("[%d] %s ... ", total, name); fflush(stdout); } while(0)
@@ -28,7 +29,7 @@ static arbitro_client_t *connect_big(void) {
     arbitro_client_t *c; arbitro_opts_t o;
     arbitro_opts_init(&o);
     o.frame_buf_size = 2 * 1024 * 1024;
-    arbitro_client_connect("127.0.0.1", 9898, &o, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c);
     return c;
 }
 
@@ -407,7 +408,7 @@ static void test_publish_rejects_toolarge(void) {
     arbitro_opts_t o;
     arbitro_opts_init(&o);
     o.frame_buf_size = 4096;
-    arbitro_client_connect("127.0.0.1", 9898, &o, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c);
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "tl");
     uint8_t *big = calloc(8192, 1);

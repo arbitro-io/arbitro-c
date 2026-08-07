@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0, skipped = 0;
 #define T(name) do { total++; printf("[%d] %s ... ", total, name); fflush(stdout); } while(0)
@@ -30,7 +31,7 @@ static arbitro_client_t *connect_big(void) {
     arbitro_client_t *c = NULL; arbitro_opts_t o;
     arbitro_opts_init(&o);
     o.frame_buf_size = 2 * 1024 * 1024;
-    arbitro_client_connect("127.0.0.1", 9898, &o, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c);
     return c;
 }
 

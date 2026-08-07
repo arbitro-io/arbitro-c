@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0;
 
@@ -30,7 +31,7 @@ static void test_batch_sync(void) {
     char sname[64];
     snprintf(sname, sizeof(sname), "t14_bsync_%llu", (unsigned long long)nowms());
     T("test_batch_sync");
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
     scfg.subject_filter = ">";
     arbitro_stream_upsert(c, sname, &scfg, &sid);
     for (int i = 0; i < 3; i++) {
@@ -51,7 +52,7 @@ static void test_sync_with_id(void) {
     uint64_t s1=0, s2=0; int rc; char sname[64];
     snprintf(sname, sizeof(sname), "t15_swid_%llu", (unsigned long long)nowms());
     T("test_sync_with_id");
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
     scfg.subject_filter = ">";
     arbitro_stream_upsert(c, sname, &scfg, &sid);
     rc = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"x",1,
@@ -76,7 +77,7 @@ static int on_send(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
 }
 static void *send_svc_thread(void *arg) {
     arbitro_client_t *sc; arbitro_service_t *svc; (void)arg;
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &sc);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc);
     arbitro_service_create(sc, "sendtest", 100, &svc);
     arbitro_service_handle(svc, "notify", on_send, NULL);
     arbitro_client_run(sc);
@@ -90,7 +91,7 @@ static void test_service_send(void) {
     svc_send_hits = 0;
     pthread_create(&th, NULL, send_svc_thread, NULL);
     sleep(1);
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
     arbitro_service_create(c, "sender16", 100, &svc);
     arbitro_service_send(svc, "sendtest", "notify", (const uint8_t*)"hi", 2);
     uint64_t t0 = nowms();
@@ -106,7 +107,7 @@ static void test_service_send(void) {
 static void test_request_timeout_slot_leak(void) {
     arbitro_client_t *c; uint8_t out[64]; uint32_t olen = 0; int rc;
     T("test_request_timeout_slot_leak");
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
     for (int i = 0; i < 100; i++) {
         rc = arbitro_request(c, "nonexistent_svc_18", "m", (const uint8_t*)"x",1,
                              50, out, sizeof(out), &olen);
@@ -144,7 +145,7 @@ static int on_calc_b(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
 }
 static void *host_calc_a(void *arg) {
     arbitro_client_t *sc; arbitro_service_t *svc; (void)arg;
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &sc);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc);
     arbitro_service_create(sc, "calc19a", 100, &svc);
     arbitro_service_handle(svc, "op", on_calc_a, NULL);
     arbitro_client_run(sc);
@@ -154,7 +155,7 @@ static void *host_calc_a(void *arg) {
 }
 static void *host_calc_b(void *arg) {
     arbitro_client_t *sc; arbitro_service_t *svc; (void)arg;
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &sc);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc);
     arbitro_service_create(sc, "calc19b", 100, &svc);
     arbitro_service_handle(svc, "op", on_calc_b, NULL);
     arbitro_client_run(sc);
@@ -171,8 +172,8 @@ static void test_two_clients_concurrent(void) {
     pthread_create(&th1, NULL, host_calc_a, NULL);
     pthread_create(&th2, NULL, host_calc_b, NULL);
     sleep(1);
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c1);
-    arbitro_client_connect("127.0.0.1", 9898, NULL, &c2);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c1);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c2);
     rc1 = arbitro_request(c1, "calc19a", "op", (const uint8_t*)"1",1,3000,o1,sizeof(o1),&l1);
     rc2 = arbitro_request(c2, "calc19b", "op", (const uint8_t*)"2",1,3000,o2,sizeof(o2),&l2);
     if (rc1 == 0 && rc2 == 0 && l1 == 3 && l2 == 3 &&

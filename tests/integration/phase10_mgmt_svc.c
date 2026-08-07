@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0, skipped = 0;
 
@@ -32,7 +33,7 @@ static arbitro_client_t *connect_big(void) {
     arbitro_client_t *c; arbitro_opts_t o;
     arbitro_opts_init(&o);
     o.frame_buf_size = 2 * 1024 * 1024;
-    if (arbitro_client_connect("127.0.0.1", 9898, &o, &c) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c) != 0) return NULL;
     return c;
 }
 
@@ -409,7 +410,7 @@ static char echo_svc_name[64];
 static void *echo_svc_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, echo_svc_name, 100, &svc) != 0) {
         arbitro_client_close(sc); return NULL;
     }
@@ -490,7 +491,7 @@ static char calc_svc_name[64];
 static void *calc_svc_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, calc_svc_name, 100, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "add", on_add, NULL);
     arbitro_service_handle(svc, "sub", on_sub, NULL);
@@ -534,7 +535,7 @@ static int on_ping(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
 static void *host2_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, host2_name, 100, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "p", on_ping, NULL);
     host2_ready = 1;
@@ -575,7 +576,7 @@ static int on_notify(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
 static void *notify_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, notify_name, 100, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "n", on_notify, NULL);
     notify_ready = 1;
@@ -645,7 +646,7 @@ static int on_con_b(const arbitro_request_t *req, uint8_t *out, uint32_t cap,
 static void *con_host_a(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, con_svc_a, 200, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "op", on_con_a, NULL);
     con_ready_a = 1;
@@ -657,7 +658,7 @@ static void *con_host_a(void *arg) {
 static void *con_host_b(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, con_svc_b, 200, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "op", on_con_b, NULL);
     con_ready_b = 1;
@@ -716,7 +717,7 @@ static char silent_name[64];
 static void *silent_thread(void *arg) {
     (void)arg;
     arbitro_client_t *sc; arbitro_service_t *svc;
-    if (arbitro_client_connect("127.0.0.1", 9898, NULL, &sc) != 0) return NULL;
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &sc) != 0) return NULL;
     if (arbitro_service_create(sc, silent_name, 100, &svc) != 0) { arbitro_client_close(sc); return NULL; }
     arbitro_service_handle(svc, "m", on_silent, NULL);
     silent_ready = 1;

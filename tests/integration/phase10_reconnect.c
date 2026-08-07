@@ -8,6 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0;
 #define T(name) do { total++; printf("[%d] %s ... ", total, name); fflush(stdout); } while(0)
@@ -27,7 +28,7 @@ static arbitro_client_t *connect_reconn(uint32_t reconnect_max) {
     o.reconnect = 1;
     o.reconnect_max = reconnect_max;
     o.reconnect_delay_ms = 300;
-    if (arbitro_client_connect("127.0.0.1", 9898, &o, &c) != ARBITRO_OK)
+    if (arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c) != ARBITRO_OK)
         return NULL;
     return c;
 }

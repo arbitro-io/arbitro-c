@@ -8,6 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "arbitro/arbitro.h"
+#include "test_addr.h"
 
 static int total = 0, pass = 0, fail = 0, skipped = 0;
 #define T(name) do { total++; printf("[%d] %s ... ", total, name); fflush(stdout); } while(0)
@@ -30,7 +31,7 @@ static arbitro_client_t *connect_big(void) {
     arbitro_opts_t o;
     arbitro_opts_init(&o);
     o.frame_buf_size = 2 * 1024 * 1024;
-    arbitro_client_connect("127.0.0.1", 9898, &o, &c);
+    arbitro_client_connect(arb_test_addr(), arb_test_port(), &o, &c);
     return c;
 }
 
@@ -235,14 +236,26 @@ static void t_ack_wait_redelivery(void) {
     arbitro_stream_upsert(c, n, &scfg, &sid);
     ccfg.name="cAw"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=800;
-    ccfg.max_deliver = 10;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, noack_cb, NULL);
+
+    /* Two independent budgets. Sharing one made a slow first delivery eat
+       the redelivery window, so the test failed for a reason that had
+       nothing to do with ack_wait. */
     uint64_t t0 = nowms();
-    while (hits < 2 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
-    if (hits >= 2) OK(); else FAIL("no redelivery, hits=%d", hits);
+    while (hits < 1 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    if (hits < 1) {
+        FAIL("first delivery never arrived");
+        arbitro_client_close(c);
+        return;
+    }
+    uint64_t t_first = nowms();
+    while (hits < 2 && nowms() - t_first < 6 * 800) arbitro_client_poll(c, 100);
+    if (hits >= 2) OK();
+    else FAIL("no redelivery %llums after first delivery (ack_wait=800ms)",
+              (unsigned long long)(nowms() - t_first));
     arbitro_client_close(c);
 }
 
@@ -557,9 +570,17 @@ static void t_batch_ack_flushes_at_cap(void) {
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
     uint64_t t0 = nowms();
     while (hits < 260 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    /* poll() flushes acks BEFORE dispatching, so the acks queued by the
+       final dispatch are still buffered when the loop exits — sampling
+       acks_sent here measures where polling stopped, not the batcher.
+       Drain the tail first, then require every ack to have gone out: 260
+       queued through a 256-slot ring can only survive if the cap flush
+       fired mid-dispatch. */
+    arbitro_client_flush_acks(c);
     arbitro_metrics_t m; arbitro_client_metrics(c, &m);
-    if (hits >= 260 && m.acks_sent >= 256) OK();
-    else FAIL("hits=%d acks_sent=%llu", hits, (unsigned long long)m.acks_sent);
+    if (hits == 260 && m.acks_sent == 260) OK();
+    else FAIL("hits=%d acks_sent=%llu (want 260/260)",
+              hits, (unsigned long long)m.acks_sent);
     arbitro_client_close(c);
 }
 
