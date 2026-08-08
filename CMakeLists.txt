@@ -102,19 +102,22 @@ if(ARBITRO_BUILD_TESTS)
     # struct at another's offsets at runtime. That is exactly how the SEGV in
     # arb__replyto_decode got in. Make it a hard error everywhere tests are
     # built — a callback mismatch must never reach a broker again.
+    # The library builds with -Wall -Wextra -Wpedantic -Werror; tests get the
+    # same bar. A warning tolerated here is a bug the suite cannot see.
+    set(ARBITRO_TEST_WARNINGS
+        -Wall -Wextra -Werror -Wno-unused-parameter
+        -Werror=incompatible-pointer-types
+        -Werror=implicit-function-declaration)
+
     foreach(t IN LISTS ARBITRO_PHASE_TESTS)
         get_filename_component(tn ${t} NAME_WE)
-        target_compile_options(${tn} PRIVATE
-            -Werror=incompatible-pointer-types
-            -Werror=implicit-function-declaration)
+        target_compile_options(${tn} PRIVATE ${ARBITRO_TEST_WARNINGS})
         # These tests call usleep(), which glibc hides under the strict C99
         # the library itself is built with.
         target_compile_definitions(${tn} PRIVATE _DEFAULT_SOURCE)
     endforeach()
     foreach(tn unit_tests integration queue_integration)
-        target_compile_options(${tn} PRIVATE
-            -Werror=incompatible-pointer-types
-            -Werror=implicit-function-declaration)
+        target_compile_options(${tn} PRIVATE ${ARBITRO_TEST_WARNINGS})
     endforeach()
 endif()
 

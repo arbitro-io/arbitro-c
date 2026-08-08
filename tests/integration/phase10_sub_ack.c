@@ -74,6 +74,17 @@ static void grp_cb(arbitro_msg_t *m, void *ud) {
     arbitro_msg_ack(m);
 }
 
+/* Nacks the first delivery with a delay, acks every redelivery after it. */
+#define NACK_DELAY_MS 1000
+static volatile int nd_hits = 0;
+
+static void nack_delay_cb(arbitro_msg_t *m, void *ud) {
+    (void)ud;
+    nd_hits++;
+    if (nd_hits == 1) arbitro_msg_nack_delay(m, NACK_DELAY_MS);
+    else arbitro_msg_ack(m);
+}
+
 static void capture_hash_cb(arbitro_msg_t *m, void *ud) {
     (void)ud; hits++; last_seq = m->seq;
     last_subject_hash = m->subject_hash;
@@ -660,10 +671,51 @@ static void t_nack_requeues_immediately(void) {
     arbitro_client_close(c);
 }
 
-/* 21 — nack with delay: API does not expose a delay parameter */
+/* 21 */
 static void t_nack_with_delay(void) {
+    arbitro_client_t *c = connect_big();
+    arbitro_stream_cfg_t scfg={0}; arbitro_consumer_cfg_t ccfg={0};
+    uint32_t sid, cid;
+    char n[64]; mk_name(n, sizeof(n), "nkd");
     T("10.3.6 nack with delay");
-    SKIP("arbitro_msg_nack has no delay parameter in public API");
+    scfg.subject_filter = ">";
+    arbitro_stream_upsert(c, n, &scfg, &sid);
+    ccfg.name="cNkd"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
+    arbitro_consumer_create(c, n, &ccfg, &cid);
+    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    nd_hits = 0;
+    arbitro_subscribe(c, sid, cid, nack_delay_cb, NULL);
+
+    uint64_t t0 = nowms();
+    while (nd_hits < 1 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    if (nd_hits < 1) {
+        FAIL("first delivery never arrived");
+        arbitro_client_close(c);
+        return;
+    }
+    /* The nack is buffered until a flush; the broker's delay starts when it
+       lands, so push it out before timing anything. */
+    arbitro_client_flush_nacks(c);
+    uint64_t t_nack = nowms();
+
+    /* ack_wait is 30s, so a redelivery inside the delay window can only come
+       from the delay being ignored. */
+    while (nd_hits < 2 && nowms() - t_nack < NACK_DELAY_MS / 2)
+        arbitro_client_poll(c, 50);
+    if (nd_hits >= 2) {
+        FAIL("redelivered after %llums, delay was %dms",
+             (unsigned long long)(nowms() - t_nack), NACK_DELAY_MS);
+        arbitro_client_close(c);
+        return;
+    }
+
+    while (nd_hits < 2 && nowms() - t_nack < 8 * NACK_DELAY_MS)
+        arbitro_client_poll(c, 100);
+    if (nd_hits >= 2) OK();
+    else FAIL("no redelivery %llums after a %dms nack delay",
+              (unsigned long long)(nowms() - t_nack), NACK_DELAY_MS);
+    arbitro_client_close(c);
 }
 
 /* 22 */

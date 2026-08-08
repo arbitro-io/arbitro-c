@@ -16,11 +16,6 @@ static int total = 0, pass = 0, fail = 0;
 #define FAIL(fmt, ...) do { fail++; printf("FAIL — " fmt "\n", ##__VA_ARGS__); } while(0)
 #define SKIP(reason) do { pass++; printf("SKIP — %s\n", reason); } while(0)
 
-static uint64_t nowms(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
-}
-
 static arbitro_client_t *connect_reconn(uint32_t reconnect_max) {
     arbitro_client_t *c; arbitro_opts_t o;
     arbitro_opts_init(&o);
