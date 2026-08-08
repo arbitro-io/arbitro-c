@@ -700,34 +700,42 @@ static void t_nack_with_delay(void) {
     nd_hits = 0;
     arbitro_subscribe(c, sid, cid, nack_delay_cb, NULL);
 
-    uint64_t t0 = nowms();
-    while (nd_hits < 1 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    /* The nack cannot have reached the broker before this instant, because
+       nothing has been delivered yet. arbitro_client_poll flushes buffered
+       nacks as part of its cycle, so the nack may well go out INSIDE the
+       loop below rather than at the explicit flush after it — timing from
+       the flush would then measure from after the broker's timer had
+       already started, and report a redelivery as early when it was not.
+       `t_earliest` is the only baseline that cannot flatter the broker. */
+    uint64_t t_earliest = nowms();
+    while (nd_hits < 1 && nowms() - t_earliest < 4000)
+        arbitro_client_poll(c, 100);
     if (nd_hits < 1) {
         FAIL("first delivery never arrived");
         arbitro_client_close(c);
         return;
     }
-    /* The nack is buffered until a flush; the broker's delay starts when it
-       lands, so push it out before timing anything. */
     arbitro_client_flush_nacks(c);
-    uint64_t t_nack = nowms();
+    uint64_t t_flush = nowms();
 
-    /* ack_wait is 30s, so a redelivery inside the delay window can only come
-       from the delay being ignored. */
-    while (nd_hits < 2 && nowms() - t_nack < NACK_DELAY_MS / 2)
+    /* ack_wait is 30s, so anything arriving before t_earliest + the delay
+       can only mean the delay was dropped. */
+    while (nd_hits < 2 && nowms() - t_earliest < NACK_DELAY_MS)
         arbitro_client_poll(c, 50);
     if (nd_hits >= 2) {
-        FAIL("redelivered after %llums, delay was %dms",
-             (unsigned long long)(nowms() - t_nack), NACK_DELAY_MS);
+        FAIL("redelivered %llums after the earliest possible nack "
+             "(flush was at +%llums), delay was %dms",
+             (unsigned long long)(nowms() - t_earliest),
+             (unsigned long long)(t_flush - t_earliest), NACK_DELAY_MS);
         arbitro_client_close(c);
         return;
     }
 
-    while (nd_hits < 2 && nowms() - t_nack < 8 * NACK_DELAY_MS)
+    while (nd_hits < 2 && nowms() - t_earliest < 8 * NACK_DELAY_MS)
         arbitro_client_poll(c, 100);
     if (nd_hits >= 2) OK();
     else FAIL("no redelivery %llums after a %dms nack delay",
-              (unsigned long long)(nowms() - t_nack), NACK_DELAY_MS);
+              (unsigned long long)(nowms() - t_earliest), NACK_DELAY_MS);
     arbitro_client_close(c);
 }
 
