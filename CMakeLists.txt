@@ -89,6 +89,10 @@ if(ARBITRO_BUILD_TESTS)
     # never been compiled, let alone run. They all still build clean against
     # the current API; the only thing missing was the wiring.
     file(GLOB ARBITRO_PHASE_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/*.c)
+    # alloc_hotpath interposes malloc via -Wl,--wrap, so it needs its own
+    # link line and cannot ride the generic loop.
+    list(REMOVE_ITEM ARBITRO_PHASE_TESTS
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/alloc_hotpath.c)
     foreach(phase_src ${ARBITRO_PHASE_TESTS})
         get_filename_component(phase_name ${phase_src} NAME_WE)
         add_executable(${phase_name} ${phase_src})
@@ -119,6 +123,17 @@ if(ARBITRO_BUILD_TESTS)
     foreach(tn unit_tests integration queue_integration)
         target_compile_options(${tn} PRIVATE ${ARBITRO_TEST_WARNINGS})
     endforeach()
+
+    add_executable(alloc_hotpath tests/integration/alloc_hotpath.c)
+    target_include_directories(alloc_hotpath PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(alloc_hotpath PRIVATE arbitro)
+    target_link_options(alloc_hotpath PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+    target_compile_options(alloc_hotpath PRIVATE ${ARBITRO_TEST_WARNINGS})
+    target_compile_definitions(alloc_hotpath PRIVATE _DEFAULT_SOURCE)
+    add_test(NAME alloc_hotpath COMMAND alloc_hotpath)
 endif()
 
 # --- Examples ---
@@ -142,6 +157,22 @@ if(ARBITRO_BUILD_BENCHMARKS)
 
     add_executable(bench_limits benchmarks/bench_limits.c)
     target_link_libraries(bench_limits PRIVATE arbitro)
+
+    # These two existed on disk but were never wired, so they had never been
+    # compiled — the same way ~85 integration tests were orphaned.
+    add_executable(bench_throughput benchmarks/bench_throughput.c)
+    target_link_libraries(bench_throughput PRIVATE arbitro)
+
+    add_executable(bench_chaos benchmarks/bench_chaos.c)
+    target_link_libraries(bench_chaos PRIVATE arbitro)
+
+    foreach(bn bench_publish bench_roundtrip bench_limits bench_throughput bench_chaos)
+        target_compile_options(${bn} PRIVATE
+            -Wall -Wextra -Werror -Wno-unused-parameter
+            -Werror=incompatible-pointer-types
+            -Werror=implicit-function-declaration)
+        target_compile_definitions(${bn} PRIVATE _DEFAULT_SOURCE)
+    endforeach()
 endif()
 
 # --- Install ---

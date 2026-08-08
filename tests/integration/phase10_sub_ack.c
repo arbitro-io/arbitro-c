@@ -85,6 +85,19 @@ static void nack_delay_cb(arbitro_msg_t *m, void *ud) {
     else arbitro_msg_ack(m);
 }
 
+/* msg_copy must survive the delivery buffer being recycled, so the copy is
+   taken in the callback and only inspected after the client is closed. */
+static arbitro_msg_owned_t g_owned;
+static int g_owned_rc = -1;
+
+static void copy_cb(arbitro_msg_t *m, void *ud) {
+    (void)ud;
+    hits++;
+    if (g_owned_rc != ARBITRO_OK)
+        g_owned_rc = arbitro_msg_copy(m, &g_owned);
+    arbitro_msg_ack(m);
+}
+
 static void capture_hash_cb(arbitro_msg_t *m, void *ud) {
     (void)ud; hits++; last_seq = m->seq;
     last_subject_hash = m->subject_hash;
@@ -718,6 +731,59 @@ static void t_nack_with_delay(void) {
     arbitro_client_close(c);
 }
 
+/* 22b — the only alloc/free pair in the library that no test exercised. */
+static void t_msg_copy_outlives_delivery(void) {
+    arbitro_client_t *c = connect_big();
+    arbitro_stream_cfg_t scfg={0}; arbitro_consumer_cfg_t ccfg={0};
+    uint32_t sid, cid;
+    const uint8_t payload[5] = { 'c','o','p','y','!' };
+    char n[64]; mk_name(n, sizeof(n), "cpy");
+    T("10.3.9 msg_copy outlives the delivery buffer");
+
+    if (arbitro_msg_copy(NULL, &g_owned) != ARBITRO_ERR_ARG) {
+        FAIL("msg_copy(NULL,...) must return ERR_ARG");
+        arbitro_client_close(c);
+        return;
+    }
+    arbitro_msg_owned_free(NULL);
+
+    scfg.subject_filter = ">";
+    arbitro_stream_upsert(c, n, &scfg, &sid);
+    ccfg.name="cCpy"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
+    arbitro_consumer_create(c, n, &ccfg, &cid);
+    arbitro_publish_sync(c, sid, (const uint8_t*)"cp.a",4, payload,5, NULL);
+
+    hits = 0;
+    g_owned_rc = -1;
+    memset(&g_owned, 0, sizeof(g_owned));
+    arbitro_subscribe(c, sid, cid, copy_cb, NULL);
+    uint64_t t0 = nowms();
+    while (hits < 1 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    /* Close first: the copy must not point into the client's read buffer. */
+    arbitro_client_close(c);
+
+    if (hits < 1) { FAIL("no delivery"); return; }
+    if (g_owned_rc != ARBITRO_OK) { FAIL("msg_copy rc=%d", g_owned_rc); return; }
+    if (g_owned.subject_len != 4 || g_owned.data_len != 5) {
+        FAIL("subject_len=%u data_len=%u (want 4/5)",
+             g_owned.subject_len, g_owned.data_len);
+        arbitro_msg_owned_free(&g_owned);
+        return;
+    }
+    if (memcmp(g_owned.buf, "cp.a", 4) != 0 ||
+        memcmp(g_owned.buf + g_owned.subject_len + g_owned.reply_len,
+               payload, 5) != 0) {
+        FAIL("copied bytes differ after close");
+        arbitro_msg_owned_free(&g_owned);
+        return;
+    }
+    arbitro_msg_owned_free(&g_owned);
+    if (g_owned.buf != NULL) { FAIL("owned_free left buf non-NULL"); return; }
+    arbitro_msg_owned_free(&g_owned);
+    OK();
+}
+
 /* 22 */
 static void t_ack_unknown_seq_ignored(void) {
     arbitro_client_t *c = connect_big();
@@ -810,6 +876,7 @@ int main(void) {
     t_client_flush_acks_manual();
     t_nack_requeues_immediately();
     t_nack_with_delay();
+    t_msg_copy_outlives_delivery();
     t_ack_unknown_seq_ignored();
     t_ack_after_unsubscribe_ignored();
     printf("=== %d/%d passed (%d failed, %d skipped) ===\n",

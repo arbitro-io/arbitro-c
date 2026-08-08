@@ -2517,13 +2517,25 @@ int arbitro_msg_reply(arbitro_msg_t *msg, const uint8_t *payload,
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 int arbitro_msg_copy(const arbitro_msg_t *msg, arbitro_msg_owned_t *out) {
-    size_t total = (size_t)msg->subject_len + msg->reply_len + msg->data_len;
-    uint8_t *buf = (uint8_t *)malloc(total);
+    size_t total;
+    uint8_t *buf;
+
+    if (!msg || !out) return ARBITRO_ERR_ARG;
+
+    total = (size_t)msg->subject_len + msg->reply_len + msg->data_len;
+    /* malloc(0) may return NULL, which would report NOMEM for a message
+       that is simply empty. */
+    buf = (uint8_t *)malloc(total ? total : 1);
     if (!buf) return ARBITRO_ERR_NOMEM;
 
-    memcpy(buf, msg->subject, msg->subject_len);
-    memcpy(buf + msg->subject_len, msg->reply_to, msg->reply_len);
-    memcpy(buf + msg->subject_len + msg->reply_len, msg->data, msg->data_len);
+    /* A single Deliver carries no reply_to, so that pointer is NULL with
+       length 0 — and memcpy from NULL is undefined even for 0 bytes. */
+    if (msg->subject_len)
+        memcpy(buf, msg->subject, msg->subject_len);
+    if (msg->reply_len)
+        memcpy(buf + msg->subject_len, msg->reply_to, msg->reply_len);
+    if (msg->data_len)
+        memcpy(buf + msg->subject_len + msg->reply_len, msg->data, msg->data_len);
 
     out->buf          = buf;
     out->subject_len  = msg->subject_len;

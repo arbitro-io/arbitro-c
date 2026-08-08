@@ -60,13 +60,6 @@ static void report(const char *label, double *latencies, int n) {
 static int delivered_count;
 static int stop_at;
 
-static void on_deliver_count(arbitro_msg_t *msg, void *ud) {
-    (void)ud;
-    delivered_count++;
-    if (delivered_count >= stop_at)
-        arbitro_client_stop(msg->client);
-}
-
 static void on_deliver_count_ack(arbitro_msg_t *msg, void *ud) {
     (void)ud;
     arbitro_msg_ack(msg);
