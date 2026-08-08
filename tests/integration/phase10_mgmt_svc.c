@@ -8,6 +8,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include "arbitro/arbitro.h"
 #include "test_addr.h"
 
@@ -40,6 +41,10 @@ static arbitro_client_t *connect_big(void) {
 static volatile int g_hits;
 static void count_and_ack(arbitro_msg_t *m, void *u) {
     (void)u; g_hits++; arbitro_msg_ack(m);
+}
+
+static void count_no_ack(arbitro_msg_t *m, void *u) {
+    (void)u; (void)m; g_hits++;
 }
 
 /* ─────────────────────────────────────────────────────────────────────── */
@@ -377,14 +382,93 @@ static void test_consumer_list_per_stream(void) {
 }
 
 static void test_pause_resume_consumer(void) {
+    arbitro_client_t *c = connect_big();
+    arbitro_stream_cfg_t scfg = {0};
+    arbitro_consumer_cfg_t ccfg = {0};
+    uint32_t sid, cid;
+    char n[64]; mk_name(n, sizeof(n), "cm_pr");
     T("10.5.6 pause/resume consumer");
-    SKIP("no pause API in arbitro.h");
-    arbitro_client_close(NULL);
+    scfg.subject_filter = ">";
+    arbitro_stream_upsert(c, n, &scfg, &sid);
+    ccfg.name = "cPr"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight = 100; ccfg.ack_wait_ms = 30000;
+    if (arbitro_consumer_create(c, n, &ccfg, &cid) != 0) {
+        FAIL("consumer_create");
+        arbitro_client_close(c);
+        return;
+    }
+    for (int i = 0; i < 5; i++)
+        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+
+    int rc = arbitro_pause_consumer(c, n, "cPr");
+    if (rc != 0) {
+        FAIL("pause rc=%d", rc);
+        arbitro_client_close(c);
+        return;
+    }
+    g_hits = 0;
+    arbitro_subscribe(c, sid, cid, count_and_ack, NULL);
+    uint64_t t0 = nowms();
+    while (nowms() - t0 < 1200) arbitro_client_poll(c, 100);
+    if (g_hits != 0) {
+        FAIL("paused consumer delivered %d", g_hits);
+        arbitro_client_close(c);
+        return;
+    }
+
+    rc = arbitro_resume_consumer(c, n, "cPr");
+    if (rc != 0) {
+        FAIL("resume rc=%d", rc);
+        arbitro_client_close(c);
+        return;
+    }
+    t0 = nowms();
+    while (g_hits < 5 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    if (g_hits >= 5) OK();
+    else FAIL("after resume delivered %d of 5", g_hits);
+    arbitro_client_close(c);
 }
 
 static void test_consumer_stats_pending(void) {
+    arbitro_client_t *c = connect_big();
+    arbitro_stream_cfg_t scfg = {0};
+    arbitro_consumer_cfg_t ccfg = {0};
+    uint32_t sid, cid;
+    uint64_t pending = 0;
+    char n[64]; mk_name(n, sizeof(n), "cm_st");
     T("10.5.7 consumer_stats pending");
-    SKIP("consumer_info exposes only consumer_id in current C API");
+    scfg.subject_filter = ">";
+    arbitro_stream_upsert(c, n, &scfg, &sid);
+    ccfg.name = "cSt"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.max_inflight = 100; ccfg.ack_wait_ms = 30000;
+    if (arbitro_consumer_create(c, n, &ccfg, &cid) != 0) {
+        FAIL("consumer_create");
+        arbitro_client_close(c);
+        return;
+    }
+    if (arbitro_get_pending(c, cid, &pending) != 0 || pending != 0) {
+        FAIL("fresh consumer pending=%llu (want 0)",
+             (unsigned long long)pending);
+        arbitro_client_close(c);
+        return;
+    }
+    for (int i = 0; i < 4; i++)
+        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+
+    /* noack_and_count leaves every delivery unacked, so they stay pending. */
+    g_hits = 0;
+    arbitro_subscribe(c, sid, cid, count_no_ack, NULL);
+    uint64_t t0 = nowms();
+    while (g_hits < 4 && nowms() - t0 < 4000) arbitro_client_poll(c, 100);
+    if (g_hits < 4) {
+        FAIL("delivered %d of 4", g_hits);
+        arbitro_client_close(c);
+        return;
+    }
+    int rc = arbitro_get_pending(c, cid, &pending);
+    if (rc == 0 && pending == 4) OK();
+    else FAIL("rc=%d pending=%llu (want 4)", rc, (unsigned long long)pending);
+    arbitro_client_close(c);
 }
 
 /* ─────────────────────────────────────────────────────────────────────── */
@@ -743,10 +827,53 @@ static void test_service_handler_crash_returns_timeout(void) {
     arbitro_client_close(c);
 }
 
-/* Test 28: requester disconnects mid-flight — SKIP */
+/* Test 28: requester disconnects mid-flight.
+   Mirrors Rust's many_inflight_publish_wait_wake_on_disconnect: the test
+   fails by HANGING, not by which error comes back. A waiter that only
+   unblocks when its own timeout expires is a leaked waiter. */
+static volatile int killer_armed = 0;
+static int killer_fd = -1;
+
+static void *socket_killer(void *arg) {
+    (void)arg;
+    usleep(300 * 1000);
+    killer_armed = 1;
+    if (killer_fd >= 0) shutdown(killer_fd, SHUT_RDWR);
+    return NULL;
+}
+
 static void test_request_disconnects_mid_flight(void) {
+    arbitro_client_t *c = connect_big();
+    pthread_t th;
+    uint8_t out[64]; uint32_t olen = 0;
+    char target[64];
     T("10.6.10 request_disconnects_mid_flight");
-    SKIP("hard to simulate reliably without broker inspection");
+    snprintf(target, sizeof(target), "ghost_%llu", (unsigned long long)nowms());
+
+    killer_armed = 0;
+    killer_fd = arbitro_client_fd(c);
+    if (killer_fd < 0) {
+        FAIL("no fd exposed");
+        arbitro_client_close(c);
+        return;
+    }
+    pthread_create(&th, NULL, socket_killer, NULL);
+
+    uint64_t t0 = nowms();
+    int rc = arbitro_request(c, target, "m", (const uint8_t*)"x", 1,
+                             20000, out, sizeof(out), &olen);
+    uint64_t elapsed = nowms() - t0;
+    pthread_join(th, NULL);
+
+    if (rc == ARBITRO_OK) {
+        FAIL("request succeeded against a dead socket");
+    } else if (elapsed >= 5000) {
+        FAIL("woke after %llums — waiter rode its own 20000ms timeout "
+             "instead of the disconnect", (unsigned long long)elapsed);
+    } else {
+        OK();
+    }
+    arbitro_client_close(c);
 }
 
 /* Test 29: request to non-existent → ERR_TIMEOUT/NOTFOUND/BROKER */

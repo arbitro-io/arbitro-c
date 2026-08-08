@@ -379,10 +379,18 @@ ARB__UNUSED static int arb__net_writev2(arb_sock_t s,
     iov[1].iov_base = (void *)(uintptr_t)b;
     iov[1].iov_len  = blen;
     {
+        /* sendmsg, not writev: writev takes no flags, so a write to a peer
+           that has gone away raises SIGPIPE and kills the host process.
+           Library code must never install a signal handler, so the escape
+           is MSG_NOSIGNAL per call — same guard arb__net_send already uses. */
+        struct msghdr mh;
         ssize_t total = (ssize_t)(alen + blen);
         ssize_t done = 0;
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = iov;
+        mh.msg_iovlen = 2;
         while (done < total) {
-            ssize_t n = writev(s, iov, 2);
+            ssize_t n = sendmsg(s, &mh, MSG_NOSIGNAL);
             if (n <= 0) return ARBITRO_ERR_SOCKET;
             done += n;
             if (done >= total) break;
@@ -921,13 +929,20 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     case ARB_ACT_REP_OK: {
         arb_pending_t *p = arb__pending_find(c, fr->seq);
         if (p) {
-            p->err_code = ARBITRO_OK;
-            if (body_len > 0 && body_len <= sizeof(p->rep_buf)) {
-                memcpy(p->rep_buf, body, body_len);
-                p->rep_len = body_len;
+            /* A body that does not fit used to be dropped while the call
+               still reported success, so the caller got an empty reply and
+               no way to tell. Surface it. */
+            if (body_len > sizeof(p->rep_buf)) {
+                p->err_code = ARBITRO_ERR_TOOLARGE;
+            } else {
+                p->err_code = ARBITRO_OK;
+                if (body_len > 0) {
+                    memcpy(p->rep_buf, body, body_len);
+                    p->rep_len = body_len;
+                }
+                if (body_len >= 8)
+                    p->rep_u64 = arb__get_u64(body);
             }
-            if (body_len >= 8)
-                p->rep_u64 = arb__get_u64(body);
             p->done = 1;
         }
         return ARBITRO_OK;
@@ -937,10 +952,14 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     case ARB_ACT_LIST_CONSUMERS: {
         arb_pending_t *p = arb__pending_find(c, fr->seq);
         if (p) {
-            p->err_code = ARBITRO_OK;
-            if (body_len > 0 && body_len <= sizeof(p->rep_buf)) {
-                memcpy(p->rep_buf, body, body_len);
-                p->rep_len = body_len;
+            if (body_len > sizeof(p->rep_buf)) {
+                p->err_code = ARBITRO_ERR_TOOLARGE;
+            } else {
+                p->err_code = ARBITRO_OK;
+                if (body_len > 0) {
+                    memcpy(p->rep_buf, body, body_len);
+                    p->rep_len = body_len;
+                }
             }
             p->done = 1;
         }
@@ -2861,24 +2880,38 @@ int arbitro_stream_info(arbitro_client_t *c, const char *name,
 
 int arbitro_stream_list(arbitro_client_t *c, arbitro_stream_info_t *out,
                         size_t cap, size_t *out_n) {
+    /* Paged. One shot at limit=1000 overflows the 16 KB reply buffer on a
+       broker with a few hundred streams; the reply was then dropped and the
+       call reported success with zero entries. */
+    enum { ARB_LIST_PAGE = 96 };
     uint8_t body[64];
     arb_json_t j;
     size_t blen;
-    arb_pending_t *rep = NULL;
-    int rc;
+    int rc = ARBITRO_OK;
     size_t count = 0;
+    uint32_t offset = 0;
 
-    arb__json_begin(&j, body, sizeof(body));
-    arb__json_key(&j, "offset");
-    arb__json_u32(&j, 0);
-    arb__json_key(&j, "limit");
-    arb__json_u32(&j, 1000);
-    blen = arb__json_end(&j);
+    while (count < cap) {
+        arb_pending_t *rep = NULL;
+        uint32_t n, i, off = 4;
 
-    rc = arb__request_ok(c, ARB_ACT_LIST_STREAMS, body, (uint32_t)blen, &rep);
-    if (rc == ARBITRO_OK && rep && rep->rep_len >= 4) {
-        uint32_t n = arb__get_u32(rep->rep_buf);
-        uint32_t i, off = 4;
+        arb__json_begin(&j, body, sizeof(body));
+        arb__json_key(&j, "offset");
+        arb__json_u32(&j, offset);
+        arb__json_key(&j, "limit");
+        arb__json_u32(&j, ARB_LIST_PAGE);
+        blen = arb__json_end(&j);
+
+        rc = arb__request_ok(c, ARB_ACT_LIST_STREAMS, body, (uint32_t)blen, &rep);
+        if (rc != ARBITRO_OK) {
+            if (rep) arb__pending_release(rep);
+            break;
+        }
+        if (!rep || rep->rep_len < 4) {
+            if (rep) arb__pending_release(rep);
+            break;
+        }
+        n = arb__get_u32(rep->rep_buf);
         for (i = 0; i < n && count < cap; i++) {
             uint16_t name_len;
             if (off + 6 > rep->rep_len) break;
@@ -2887,9 +2920,11 @@ int arbitro_stream_list(arbitro_client_t *c, arbitro_stream_info_t *out,
             off += 6 + name_len;
             count++;
         }
+        arb__pending_release(rep);
+        if (n < ARB_LIST_PAGE) break;
+        offset += n;
     }
     if (out_n) *out_n = count;
-    if (rep) arb__pending_release(rep);
     return rc;
 }
 
