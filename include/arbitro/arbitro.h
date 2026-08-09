@@ -10,7 +10,7 @@ extern "C" {
 
 #define ARBITRO_VERSION_MAJOR 0
 #define ARBITRO_VERSION_MINOR 2
-#define ARBITRO_VERSION_PATCH 0
+#define ARBITRO_VERSION_PATCH 1
 
 #define ARBITRO_DEFAULT_PORT       9898
 #define ARBITRO_MAX_SUBJECT_LEN    255
@@ -34,6 +34,7 @@ extern "C" {
 #define ARBITRO_ERR_NOTFOUND  -11
 #define ARBITRO_ERR_STATE     -12
 #define ARBITRO_ERR_POOL      -13
+#define ARBITRO_ERR_AUTH      -14
 
 #define ARBITRO_ACK_NONE      0
 #define ARBITRO_ACK_EXPLICIT  1
@@ -66,6 +67,11 @@ typedef struct arbitro_opts {
     uint32_t reconnect_delay_ms;
     uint32_t keepalive_interval_ms; /* 0 disables client-initiated Ping */
     uint32_t keepalive_timeout_ms;  /* 0 disables Pong-staleness watchdog */
+
+    /* Bearer token sent once, right after Hello, and again on every reconnect.
+       NULL = no Auth frame, which is what a broker with auth disabled expects.
+       A wrong token is terminal: reconnect stops instead of retrying forever. */
+    const char *auth_token;
 
     int         tls_enabled;      /* 0/1 — requires build with ARBITRO_TLS */
     const char *tls_server_name;  /* SNI override; NULL falls back to host */

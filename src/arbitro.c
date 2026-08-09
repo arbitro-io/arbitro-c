@@ -47,6 +47,11 @@
 #define ARB_MAGIC           0x32425241u
 #define ARB_PROTO_VERSION   2
 #define ARB_HDR_LEN         16
+/* Broker rejects an Auth frame body above 4096 (SEC-1); a longer token is a
+   config error, caught locally so it never becomes a confusing disconnect. */
+#define ARB_MAX_AUTH_TOKEN  4096
+#define ARB_ERRCODE_AUTH_REQUIRED 0x0101
+#define ARB_ERRCODE_AUTH_FAILED   0x0102
 
 #define ARB_ACT_HELLO           0x0001
 #define ARB_ACT_AUTH            0x0002
@@ -180,6 +185,7 @@ const char *arbitro_err_str(int code) {
     case ARBITRO_ERR_ARG:       return "invalid argument";
     case ARBITRO_ERR_NOTFOUND:  return "not found";
     case ARBITRO_ERR_STATE:     return "invalid state";
+    case ARBITRO_ERR_AUTH:      return "authentication rejected by broker";
     default:                    return "unknown error";
     }
 }
@@ -197,6 +203,9 @@ void arbitro_opts_init(arbitro_opts_t *opts) {
     opts->reconnect_delay_ms    = 500;
     opts->keepalive_interval_ms = 30000;
     opts->keepalive_timeout_ms  = 60000;
+    /* No implicit getenv: this client keeps no global state, so embedders wire
+       ARBITRO_TOKEN themselves if they want it. */
+    opts->auth_token            = NULL;
 
     opts->tls_enabled     = 0;
     opts->tls_server_name = NULL;
@@ -514,6 +523,12 @@ struct arbitro_client {
     uint32_t     reconnect_delay_ms;
     uint32_t     keepalive_interval_ms;
     uint32_t     keepalive_timeout_ms;
+
+    char         auth_token[ARB_MAX_AUTH_TOKEN];
+    size_t       auth_token_len;
+    /* Broker refused these credentials — only a config change can fix it, so
+       reconnect must stop instead of hammering the broker forever. */
+    int          auth_rejected;
     uint64_t     last_ping_sent_ms;
     uint64_t     last_ping_sent_ns;
     uint64_t     last_pong_ms;
@@ -615,14 +630,32 @@ ARB__UNUSED static int arb__io_writev2(arbitro_client_t *c,
 /* Hello handshake                                                            */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Hello + optional Auth in ONE send: the broker's handshake deadline covers
+   both, and this is the only writer of either frame — connect and reconnect
+   share it, so a reconnect cannot drop the token. Nothing is read back; the
+   broker answers only on failure. */
 ARB__UNUSED static int arb__send_hello(arbitro_client_t *c) {
-    uint8_t hello[8];
-    arb__put_u32(hello, ARB_MAGIC);
-    hello[4] = ARB_PROTO_VERSION;
-    hello[5] = 0;
-    hello[6] = 0;
-    hello[7] = 0;
-    return arb__io_send_all(c, hello, 8);
+    uint8_t buf[8 + ARB_HDR_LEN + ARB_MAX_AUTH_TOKEN];
+    size_t  n = 8;
+    size_t  tlen = c->auth_token_len;
+
+    arb__put_u32(buf, ARB_MAGIC);
+    buf[4] = ARB_PROTO_VERSION;
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = 0;
+
+    if (tlen > 0) {
+        /* seq 0: consumed by the handshake, before any reply correlation exists */
+        arb__put_u16(buf + n + 0, ARB_ACT_AUTH);
+        buf[n + 2] = 0;
+        buf[n + 3] = 0;
+        arb__put_u32(buf + n + 4, (uint32_t)tlen);
+        arb__put_u64(buf + n + 8, 0);
+        memcpy(buf + n + ARB_HDR_LEN, c->auth_token, tlen);
+        n += ARB_HDR_LEN + tlen;
+    }
+    return arb__io_send_all(c, buf, n);
 }
 
 /* ═════════════════════════════════════════════════════════��═════════════════ */
@@ -743,6 +776,13 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->ack_buf  = base + opts->frame_buf_size;
     c->nack_buf = base + opts->frame_buf_size + ARB_ACK_BUF_SIZE;
     c->wr_buf   = base + opts->frame_buf_size + ARB_ACK_BUF_SIZE + ARB_NACK_BUF_SIZE;
+
+    if (opts->auth_token) {
+        size_t tlen = strlen(opts->auth_token);
+        if (tlen > ARB_MAX_AUTH_TOKEN) { free(c); return ARBITRO_ERR_ARG; }
+        memcpy(c->auth_token, opts->auth_token, tlen);
+        c->auth_token_len = tlen;
+    }
 
     snprintf(c->host, sizeof(c->host), "%s", host);
     c->port               = port;
@@ -967,7 +1007,18 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
     }
 
     case ARB_ACT_REP_ERROR: {
-        arb_pending_t *p = arb__pending_find(c, fr->seq);
+        arb_pending_t *p;
+        /* Auth rejections carry seq 0 (sent from the handshake), so they match
+           no pending slot and would vanish — leaving reconnect to redial with a
+           token that can never work. Classify by code, not by correlation. */
+        if (body_len >= 10) {
+            uint16_t code = arb__get_u16(body + 8);
+            if (code == ARB_ERRCODE_AUTH_FAILED || code == ARB_ERRCODE_AUTH_REQUIRED) {
+                c->auth_rejected = 1;
+                return ARBITRO_ERR_AUTH;
+            }
+        }
+        p = arb__pending_find(c, fr->seq);
         if (p) {
             p->err_code = ARBITRO_ERR_BROKER;
             if (body_len > 0 && body_len <= sizeof(p->rep_buf)) {
@@ -3865,6 +3916,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
     int rc;
 
     if (!c->reconnect) return ARBITRO_ERR_CLOSED;
+    if (c->auth_rejected) return ARBITRO_ERR_AUTH;
 
 #ifdef ARBITRO_TLS
     arb__tls_close(c);
