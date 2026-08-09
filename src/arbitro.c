@@ -32,6 +32,12 @@
   #include <sys/uio.h>
   typedef int arb_sock_t;
   #define ARB_SOCK_INVALID -1
+  /* Linux-only send flag. BSD/macOS get the same guarantee from SO_NOSIGPIPE,
+     set once on the socket — see arb__net_connect. Without one of the two, a
+     write to a closed peer raises SIGPIPE and kills the embedding process. */
+  #ifndef MSG_NOSIGNAL
+    #define MSG_NOSIGNAL 0
+  #endif
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -325,6 +331,10 @@ ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
         int one = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
                    (const char *)&one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+        setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE,
+                   (const char *)&one, sizeof(one));
+#endif
     }
 
     *out_sock = sock;
