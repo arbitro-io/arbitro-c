@@ -7,15 +7,24 @@
 #include <string.h>
 #include "arbitro/arbitro.h"
 
+/* Sub-millisecond, because the samples this bench takes are sub-millisecond.
+ * Truncating to whole milliseconds quantised every latency to 0 or 1, which
+ * made p50/p90/p99 pure rounding artefacts and turned "1000 messages in 1 ms"
+ * into a throughput figure that was really just the clock's floor. */
 #ifdef _WIN32
 #include <windows.h>
-static uint64_t now_ms(void) { return GetTickCount64(); }
+static double now_ms(void) {
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart / (double)freq.QuadPart * 1000.0;
+}
 #else
 #include <time.h>
-static uint64_t now_ms(void) {
+static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 #endif
 
@@ -81,7 +90,7 @@ static int stage0_cap_enforced(arbitro_client_t *c) {
     uint32_t stream_id, consumer_id;
     uint8_t payload[PAYLOAD_SIZE];
     int rc, total, extras;
-    uint64_t t0;
+    double t0;
 
     arbitro_subject_limit_t limits[1];
     limits[0].pattern = (const uint8_t *)"orders.premium.>";
@@ -173,7 +182,7 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
     uint32_t stream_id, consumer_id;
     uint8_t payload[PAYLOAD_SIZE];
     int rc, i, lat_count = 0;
-    uint64_t t0;
+    double t0;
     char subject[64];
 
     arbitro_subject_limit_t limits[1];
@@ -214,7 +223,7 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
         delivered_count = 0;
         stop_at = 1;
 
-        start_t = (double)now_ms();
+        start_t = now_ms();
         rc = arbitro_publish(c, stream_id, (const uint8_t *)subject,
                              (uint16_t)strlen(subject), payload, PAYLOAD_SIZE);
         if (rc != ARBITRO_OK) continue;
@@ -225,7 +234,7 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
             arbitro_client_poll(c, 100);
         }
         if (delivered_count >= 1)
-            latencies[lat_count++] = (double)now_ms() - start_t;
+            latencies[lat_count++] = now_ms() - start_t;
     }
 
     arbitro_unsubscribe(c, consumer_id);
@@ -238,7 +247,7 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
     uint32_t stream_id, consumer_id;
     uint8_t payload[PAYLOAD_SIZE];
     int rc, i, lat_count = 0;
-    uint64_t t0;
+    double t0;
     char subject[64];
 
     arbitro_subject_limit_t limits[2];
@@ -316,7 +325,7 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
         delivered_count = 0;
         stop_at = 1;
 
-        start_t = (double)now_ms();
+        start_t = now_ms();
         rc = arbitro_publish(c, stream_id, (const uint8_t *)subject,
                              (uint16_t)strlen(subject), payload, PAYLOAD_SIZE);
         if (rc != ARBITRO_OK) continue;
@@ -327,7 +336,7 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
             arbitro_client_poll(c, 100);
         }
         if (delivered_count >= 1)
-            latencies[lat_count++] = (double)now_ms() - start_t;
+            latencies[lat_count++] = now_ms() - start_t;
     }
 
     arbitro_unsubscribe(c, consumer_id);
@@ -340,7 +349,7 @@ static int stage4_dynamic(arbitro_client_t *c, int n_users) {
     uint32_t stream_id, consumer_id;
     uint8_t payload[PAYLOAD_SIZE];
     int rc, i;
-    uint64_t t0, elapsed;
+    double t0, elapsed;
     double msgs_per_sec, ns_per_msg;
 
     arbitro_subject_limit_t limits[1];
@@ -410,10 +419,10 @@ static int stage4_dynamic(arbitro_client_t *c, int n_users) {
 
     arbitro_unsubscribe(c, consumer_id);
 
-    msgs_per_sec = (double)delivered_count / ((double)elapsed / 1000.0);
-    ns_per_msg = (double)elapsed * 1000000.0 / (double)delivered_count;
-    printf("  %d users | delivered=%d | elapsed=%llu ms | %.0f msg/s | %.0f ns/msg\n",
-           n_users, delivered_count, (unsigned long long)elapsed,
+    msgs_per_sec = (double)delivered_count / (elapsed / 1000.0);
+    ns_per_msg = elapsed * 1000000.0 / (double)delivered_count;
+    printf("  %d users | delivered=%d | elapsed=%.3f ms | %.0f msg/s | %.0f ns/msg\n",
+           n_users, delivered_count, elapsed,
            msgs_per_sec, ns_per_msg);
     return 0;
 }
