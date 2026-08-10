@@ -49,6 +49,10 @@ extern "C" {
 #define ARBITRO_ERR_STATE     -12
 #define ARBITRO_ERR_POOL      -13
 #define ARBITRO_ERR_AUTH      -14
+/* Transient: the kernel buffer is full on a non-blocking socket and NOTHING
+   of the frame was written. Retry the same call. Every other error is
+   terminal for the connection. */
+#define ARBITRO_ERR_WOULDBLOCK -15
 
 #define ARBITRO_ACK_NONE      0
 #define ARBITRO_ACK_EXPLICIT  1
@@ -81,6 +85,14 @@ typedef struct arbitro_opts {
     uint32_t reconnect_delay_ms;
     uint32_t keepalive_interval_ms; /* 0 disables client-initiated Ping */
     uint32_t keepalive_timeout_ms;  /* 0 disables Pong-staleness watchdog */
+
+    /* SO_SNDBUF request, applied right after connect. There is no user-space
+       send queue in this client, so this is what decides how much unsent
+       data can pile up before arbitro_publish starts returning
+       ARBITRO_ERR_WOULDBLOCK on a non-blocking socket. 0 = leave the OS
+       default alone. The kernel may round or cap it (Linux doubles it), so
+       treat it as a request, not a guarantee -- never read it back and assert on it. */
+    uint32_t send_buf_size;
 
     /* Bearer token sent once, right after Hello, and again on every reconnect.
        NULL = no Auth frame, which is what a broker with auth disabled expects.
@@ -648,6 +660,7 @@ const char *arbitro_err_str(int code) {
     case ARBITRO_ERR_NOTFOUND:  return "not found";
     case ARBITRO_ERR_STATE:     return "invalid state";
     case ARBITRO_ERR_AUTH:      return "authentication rejected by broker";
+    case ARBITRO_ERR_WOULDBLOCK: return "send buffer full, retry";
     default:                    return "unknown error";
     }
 }
@@ -665,6 +678,7 @@ void arbitro_opts_init(arbitro_opts_t *opts) {
     opts->reconnect_delay_ms    = 500;
     opts->keepalive_interval_ms = 30000;
     opts->keepalive_timeout_ms  = 60000;
+    opts->send_buf_size         = 0;
     /* No implicit getenv: this client keeps no global state, so embedders wire
        ARBITRO_TOKEN themselves if they want it. */
     opts->auth_token            = NULL;
@@ -696,7 +710,8 @@ ARB__UNUSED static int arb__net_init(void) {
 }
 
 ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
-                                        uint32_t timeout_ms, arb_sock_t *out_sock) {
+                                        uint32_t timeout_ms, uint32_t send_buf_size,
+                                        arb_sock_t *out_sock) {
     struct addrinfo hints, *res, *rp;
     char port_str[8];
     arb_sock_t sock = ARB_SOCK_INVALID;
@@ -791,23 +806,72 @@ ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
         setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE,
                    (const char *)&one, sizeof(one));
 #endif
+        if (send_buf_size > 0) {
+            int sbuf = (int)send_buf_size;
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+                       (const char *)&sbuf, sizeof(sbuf));
+        }
     }
 
     *out_sock = sock;
     return ARBITRO_OK;
 }
 
+#ifdef _WIN32
+  #define ARB__WOULDBLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
+  #define ARB__INTR()       (WSAGetLastError() == WSAEINTR)
+#else
+  #define ARB__WOULDBLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
+  #define ARB__INTR()       (errno == EINTR)
+#endif
+
+static int arb__net_wait_writable(arb_sock_t s) {
+    for (;;) {
+#ifdef _WIN32
+        fd_set wf;
+        int rc;
+        FD_ZERO(&wf);
+        FD_SET(s, &wf);
+        rc = select(0, NULL, &wf, NULL, NULL);
+#else
+        struct pollfd p;
+        int rc;
+        p.fd = s;
+        p.events = POLLOUT;
+        p.revents = 0;
+        rc = poll(&p, 1, -1);
+#endif
+        if (rc > 0) return ARBITRO_OK;
+        if (rc < 0 && ARB__INTR()) continue;
+        return ARBITRO_ERR_SOCKET;
+    }
+}
+
 ARB__UNUSED static int arb__net_send_all(arb_sock_t s, const uint8_t *buf, size_t len) {
+    size_t done = 0;
     while (len > 0) {
 #ifdef _WIN32
         int n = send(s, (const char *)buf, (int)len, 0);
-        if (n <= 0) return ARBITRO_ERR_SOCKET;
 #else
         ssize_t n = send(s, buf, len, MSG_NOSIGNAL);
-        if (n <= 0) return ARBITRO_ERR_SOCKET;
 #endif
+        if (n <= 0) {
+            if (n < 0 && ARB__INTR()) continue;
+            if (n < 0 && ARB__WOULDBLOCK()) {
+                /* Only a zero-progress stall is retryable by the caller: once
+                   any byte of a frame is on the wire the rest must follow, or
+                   the broker's framer reads the next frame's header from the
+                   middle of this one. Mid-frame, block until writable. */
+                if (done == 0) return ARBITRO_ERR_WOULDBLOCK;
+                if (arb__net_wait_writable(s) != ARBITRO_OK)
+                    return ARBITRO_ERR_SOCKET;
+                continue;
+            }
+            return ARBITRO_ERR_SOCKET;
+        }
         buf += n;
         len -= (size_t)n;
+        done += (size_t)n;
     }
     return ARBITRO_OK;
 }
@@ -836,8 +900,15 @@ ARB__UNUSED static int arb__net_writev2(arb_sock_t s,
     bufs[0].len = (ULONG)alen;
     bufs[1].buf = (char *)(uintptr_t)b;
     bufs[1].len = (ULONG)blen;
-    if (WSASend(s, bufs, 2, &sent, 0, NULL, NULL) != 0)
-        return ARBITRO_ERR_SOCKET;
+    if (WSASend(s, bufs, 2, &sent, 0, NULL, NULL) != 0) {
+        /* Nothing left the process, so the frame is still atomic — the caller
+           may retry the whole thing. */
+        if (ARB__WOULDBLOCK()) return ARBITRO_ERR_WOULDBLOCK;
+        if (!ARB__INTR()) return ARBITRO_ERR_SOCKET;
+        return arb__net_send_all(s, a, alen) == ARBITRO_OK
+             ? arb__net_send_all(s, b, blen)
+             : ARBITRO_ERR_SOCKET;
+    }
     if (sent < (DWORD)(alen + blen)) {
         size_t remain = (alen + blen) - sent;
         if (sent < alen) {
@@ -866,7 +937,18 @@ ARB__UNUSED static int arb__net_writev2(arb_sock_t s,
         mh.msg_iovlen = 2;
         while (done < total) {
             ssize_t n = sendmsg(s, &mh, MSG_NOSIGNAL);
-            if (n <= 0) return ARBITRO_ERR_SOCKET;
+            if (n <= 0) {
+                if (n < 0 && ARB__INTR()) continue;
+                if (n < 0 && ARB__WOULDBLOCK()) {
+                    /* Same rule as arb__net_send_all: retryable only while the
+                       frame is still entirely unsent. */
+                    if (done == 0) return ARBITRO_ERR_WOULDBLOCK;
+                    if (arb__net_wait_writable(s) != ARBITRO_OK)
+                        return ARBITRO_ERR_SOCKET;
+                    continue;
+                }
+                return ARBITRO_ERR_SOCKET;
+            }
             done += n;
             if (done >= total) break;
             if ((size_t)done < alen) {
@@ -989,6 +1071,7 @@ struct arbitro_client {
     uint32_t     reconnect_delay_ms;
     uint32_t     keepalive_interval_ms;
     uint32_t     keepalive_timeout_ms;
+    uint32_t     send_buf_size;
 
     char         auth_token[ARB_MAX_AUTH_TOKEN];
     size_t       auth_token_len;
@@ -1260,6 +1343,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->reconnect_delay_ms = opts->reconnect_delay_ms;
     c->keepalive_interval_ms = opts->keepalive_interval_ms;
     c->keepalive_timeout_ms  = opts->keepalive_timeout_ms;
+    c->send_buf_size         = opts->send_buf_size;
     c->next_seq           = 1;
     c->sock               = ARB_SOCK_INVALID;
 
@@ -1276,7 +1360,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
         return ARBITRO_ERR_NOMEM;
     }
 
-    rc = arb__net_connect(host, port, opts->connect_timeout_ms, &c->sock);
+    rc = arb__net_connect(host, port, opts->connect_timeout_ms, opts->send_buf_size, &c->sock);
     if (rc != ARBITRO_OK) {
         free(c->ackrel);
         free(c);
@@ -4402,7 +4486,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
             nanosleep(&ts, NULL);
         }
 #endif
-        rc = arb__net_connect(c->host, c->port, c->connect_timeout_ms, &c->sock);
+        rc = arb__net_connect(c->host, c->port, c->connect_timeout_ms, c->send_buf_size, &c->sock);
 #ifdef ARBITRO_TLS
         if (rc == ARBITRO_OK && c->tls_enabled) {
             rc = arb__tls_connect(c, c->tls_server_name);
