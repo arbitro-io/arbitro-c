@@ -72,6 +72,14 @@ typedef struct arbitro_opts {
     uint32_t keepalive_interval_ms; /* 0 disables client-initiated Ping */
     uint32_t keepalive_timeout_ms;  /* 0 disables Pong-staleness watchdog */
 
+    /* SO_SNDBUF request, applied right after connect. There is no user-space
+       send queue in this client, so this is what decides how much unsent
+       data can pile up before arbitro_publish starts returning
+       ARBITRO_ERR_WOULDBLOCK on a non-blocking socket. 0 = leave the OS
+       default alone. The kernel may round or cap it (Linux doubles it), so
+       treat it as a request, not a guarantee -- never read it back and assert on it. */
+    uint32_t send_buf_size;
+
     /* Bearer token sent once, right after Hello, and again on every reconnect.
        NULL = no Auth frame, which is what a broker with auth disabled expects.
        A wrong token is terminal: reconnect stops instead of retrying forever. */

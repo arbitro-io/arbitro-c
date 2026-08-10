@@ -210,6 +210,7 @@ void arbitro_opts_init(arbitro_opts_t *opts) {
     opts->reconnect_delay_ms    = 500;
     opts->keepalive_interval_ms = 30000;
     opts->keepalive_timeout_ms  = 60000;
+    opts->send_buf_size         = 0;
     /* No implicit getenv: this client keeps no global state, so embedders wire
        ARBITRO_TOKEN themselves if they want it. */
     opts->auth_token            = NULL;
@@ -241,7 +242,8 @@ ARB__UNUSED static int arb__net_init(void) {
 }
 
 ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
-                                        uint32_t timeout_ms, arb_sock_t *out_sock) {
+                                        uint32_t timeout_ms, uint32_t send_buf_size,
+                                        arb_sock_t *out_sock) {
     struct addrinfo hints, *res, *rp;
     char port_str[8];
     arb_sock_t sock = ARB_SOCK_INVALID;
@@ -336,6 +338,11 @@ ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
         setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE,
                    (const char *)&one, sizeof(one));
 #endif
+        if (send_buf_size > 0) {
+            int sbuf = (int)send_buf_size;
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+                       (const char *)&sbuf, sizeof(sbuf));
+        }
     }
 
     *out_sock = sock;
@@ -596,6 +603,7 @@ struct arbitro_client {
     uint32_t     reconnect_delay_ms;
     uint32_t     keepalive_interval_ms;
     uint32_t     keepalive_timeout_ms;
+    uint32_t     send_buf_size;
 
     char         auth_token[ARB_MAX_AUTH_TOKEN];
     size_t       auth_token_len;
@@ -867,6 +875,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
     c->reconnect_delay_ms = opts->reconnect_delay_ms;
     c->keepalive_interval_ms = opts->keepalive_interval_ms;
     c->keepalive_timeout_ms  = opts->keepalive_timeout_ms;
+    c->send_buf_size         = opts->send_buf_size;
     c->next_seq           = 1;
     c->sock               = ARB_SOCK_INVALID;
 
@@ -883,7 +892,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
         return ARBITRO_ERR_NOMEM;
     }
 
-    rc = arb__net_connect(host, port, opts->connect_timeout_ms, &c->sock);
+    rc = arb__net_connect(host, port, opts->connect_timeout_ms, opts->send_buf_size, &c->sock);
     if (rc != ARBITRO_OK) {
         free(c->ackrel);
         free(c);
@@ -4009,7 +4018,7 @@ static ARB__UNUSED int arb__reconnect(arbitro_client_t *c) {
             nanosleep(&ts, NULL);
         }
 #endif
-        rc = arb__net_connect(c->host, c->port, c->connect_timeout_ms, &c->sock);
+        rc = arb__net_connect(c->host, c->port, c->connect_timeout_ms, c->send_buf_size, &c->sock);
 #ifdef ARBITRO_TLS
         if (rc == ARBITRO_OK && c->tls_enabled) {
             rc = arb__tls_connect(c, c->tls_server_name);
