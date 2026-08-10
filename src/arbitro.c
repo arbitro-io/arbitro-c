@@ -192,6 +192,7 @@ const char *arbitro_err_str(int code) {
     case ARBITRO_ERR_NOTFOUND:  return "not found";
     case ARBITRO_ERR_STATE:     return "invalid state";
     case ARBITRO_ERR_AUTH:      return "authentication rejected by broker";
+    case ARBITRO_ERR_WOULDBLOCK: return "send buffer full, retry";
     default:                    return "unknown error";
     }
 }
@@ -341,17 +342,61 @@ ARB__UNUSED static int arb__net_connect(const char *host, uint16_t port,
     return ARBITRO_OK;
 }
 
+#ifdef _WIN32
+  #define ARB__WOULDBLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
+  #define ARB__INTR()       (WSAGetLastError() == WSAEINTR)
+#else
+  #define ARB__WOULDBLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
+  #define ARB__INTR()       (errno == EINTR)
+#endif
+
+static int arb__net_wait_writable(arb_sock_t s) {
+    for (;;) {
+#ifdef _WIN32
+        fd_set wf;
+        int rc;
+        FD_ZERO(&wf);
+        FD_SET(s, &wf);
+        rc = select(0, NULL, &wf, NULL, NULL);
+#else
+        struct pollfd p;
+        int rc;
+        p.fd = s;
+        p.events = POLLOUT;
+        p.revents = 0;
+        rc = poll(&p, 1, -1);
+#endif
+        if (rc > 0) return ARBITRO_OK;
+        if (rc < 0 && ARB__INTR()) continue;
+        return ARBITRO_ERR_SOCKET;
+    }
+}
+
 ARB__UNUSED static int arb__net_send_all(arb_sock_t s, const uint8_t *buf, size_t len) {
+    size_t done = 0;
     while (len > 0) {
 #ifdef _WIN32
         int n = send(s, (const char *)buf, (int)len, 0);
-        if (n <= 0) return ARBITRO_ERR_SOCKET;
 #else
         ssize_t n = send(s, buf, len, MSG_NOSIGNAL);
-        if (n <= 0) return ARBITRO_ERR_SOCKET;
 #endif
+        if (n <= 0) {
+            if (n < 0 && ARB__INTR()) continue;
+            if (n < 0 && ARB__WOULDBLOCK()) {
+                /* Only a zero-progress stall is retryable by the caller: once
+                   any byte of a frame is on the wire the rest must follow, or
+                   the broker's framer reads the next frame's header from the
+                   middle of this one. Mid-frame, block until writable. */
+                if (done == 0) return ARBITRO_ERR_WOULDBLOCK;
+                if (arb__net_wait_writable(s) != ARBITRO_OK)
+                    return ARBITRO_ERR_SOCKET;
+                continue;
+            }
+            return ARBITRO_ERR_SOCKET;
+        }
         buf += n;
         len -= (size_t)n;
+        done += (size_t)n;
     }
     return ARBITRO_OK;
 }
@@ -380,8 +425,15 @@ ARB__UNUSED static int arb__net_writev2(arb_sock_t s,
     bufs[0].len = (ULONG)alen;
     bufs[1].buf = (char *)(uintptr_t)b;
     bufs[1].len = (ULONG)blen;
-    if (WSASend(s, bufs, 2, &sent, 0, NULL, NULL) != 0)
-        return ARBITRO_ERR_SOCKET;
+    if (WSASend(s, bufs, 2, &sent, 0, NULL, NULL) != 0) {
+        /* Nothing left the process, so the frame is still atomic — the caller
+           may retry the whole thing. */
+        if (ARB__WOULDBLOCK()) return ARBITRO_ERR_WOULDBLOCK;
+        if (!ARB__INTR()) return ARBITRO_ERR_SOCKET;
+        return arb__net_send_all(s, a, alen) == ARBITRO_OK
+             ? arb__net_send_all(s, b, blen)
+             : ARBITRO_ERR_SOCKET;
+    }
     if (sent < (DWORD)(alen + blen)) {
         size_t remain = (alen + blen) - sent;
         if (sent < alen) {
@@ -410,7 +462,18 @@ ARB__UNUSED static int arb__net_writev2(arb_sock_t s,
         mh.msg_iovlen = 2;
         while (done < total) {
             ssize_t n = sendmsg(s, &mh, MSG_NOSIGNAL);
-            if (n <= 0) return ARBITRO_ERR_SOCKET;
+            if (n <= 0) {
+                if (n < 0 && ARB__INTR()) continue;
+                if (n < 0 && ARB__WOULDBLOCK()) {
+                    /* Same rule as arb__net_send_all: retryable only while the
+                       frame is still entirely unsent. */
+                    if (done == 0) return ARBITRO_ERR_WOULDBLOCK;
+                    if (arb__net_wait_writable(s) != ARBITRO_OK)
+                        return ARBITRO_ERR_SOCKET;
+                    continue;
+                }
+                return ARBITRO_ERR_SOCKET;
+            }
             done += n;
             if (done >= total) break;
             if ((size_t)done < alen) {

@@ -35,6 +35,10 @@ extern "C" {
 #define ARBITRO_ERR_STATE     -12
 #define ARBITRO_ERR_POOL      -13
 #define ARBITRO_ERR_AUTH      -14
+/* Transient: the kernel buffer is full on a non-blocking socket and NOTHING
+   of the frame was written. Retry the same call. Every other error is
+   terminal for the connection. */
+#define ARBITRO_ERR_WOULDBLOCK -15
 
 #define ARBITRO_ACK_NONE      0
 #define ARBITRO_ACK_EXPLICIT  1
