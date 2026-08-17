@@ -5,7 +5,7 @@ All notable changes to `arbitro-c` are documented here. Format follows
 independently of the broker and its sibling clients — it is younger, and its
 numbers do not track theirs.
 
-## [Unreleased]
+## [0.3.0] — 2026-08-17
 
 ### Added — `arbitro_subscribe_batch`: N subscriptions in one round-trip
 
