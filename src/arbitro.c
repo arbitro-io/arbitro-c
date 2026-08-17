@@ -80,6 +80,8 @@
 
 #define ARB_ACT_SUBSCRIBE       0x0301
 #define ARB_ACT_UNSUBSCRIBE     0x0302
+#define ARB_ACT_SUBSCRIBE_BATCH     0x0303
+#define ARB_ACT_REP_SUBSCRIBE_BATCH 0x0304
 #define ARB_ACT_CREATE_STREAM   0x0401
 #define ARB_ACT_DELETE_STREAM   0x0402
 #define ARB_ACT_STREAM_INFO     0x0403
@@ -1084,6 +1086,7 @@ static int arb__dispatch_frame(arbitro_client_t *c, const arb_frame_t *fr,
         return ARBITRO_OK;
     }
 
+    case ARB_ACT_REP_SUBSCRIBE_BATCH:
     case ARB_ACT_LIST_STREAMS:
     case ARB_ACT_LIST_CONSUMERS: {
         arb_pending_t *p = arb__pending_find(c, fr->seq);
@@ -1635,6 +1638,153 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
 int arbitro_subscribe(arbitro_client_t *c, uint32_t stream_id,
                       uint32_t consumer_id, arbitro_msg_cb cb, void *userdata) {
     return arbitro_subscribe_filter(c, stream_id, consumer_id, NULL, 0, cb, userdata);
+}
+
+/* Scan a RepSubscribeBatch body for the entry that refused `sub_id`.
+
+   The reply lists ONLY rejections — this client allocated every id before
+   sending, so an id absent from "errors" was accepted. That is what makes a
+   hand-rolled scan enough here: there is no nesting to track, just pairs of
+   "subscription_id" and "code" inside one flat array. Returns the wire code,
+   or 0 when the id is not named. */
+static uint16_t arb__batch_reject_code(const uint8_t *body, uint32_t len,
+                                       uint32_t sub_id) {
+    const char *s = (const char *)body;
+    uint32_t i = 0;
+    while (i + 20 < len) {
+        unsigned long id = 0, code = 0;
+        uint32_t j;
+        if (memcmp(s + i, "\"subscription_id\":", 18) != 0) { i++; continue; }
+        i += 18;
+        for (; i < len && s[i] >= '0' && s[i] <= '9'; i++)
+            id = id * 10 + (unsigned long)(s[i] - '0');
+        /* "code" always follows inside the same object. */
+        for (j = i; j + 7 < len; j++) {
+            if (memcmp(s + j, "\"code\":", 7) == 0) {
+                j += 7;
+                for (; j < len && s[j] >= '0' && s[j] <= '9'; j++)
+                    code = code * 10 + (unsigned long)(s[j] - '0');
+                break;
+            }
+        }
+        if ((uint32_t)id == sub_id) return (uint16_t)code;
+    }
+    return 0;
+}
+
+int arbitro_subscribe_batch(arbitro_client_t *c, uint32_t stream_id,
+                            uint32_t consumer_id,
+                            const arbitro_sub_entry_t *entries, uint16_t count,
+                            arbitro_sub_result_t *results) {
+    uint8_t *body;
+    size_t cap = 64;
+    arb_json_t j;
+    size_t blen;
+    uint16_t n;
+    int rc, refused = 0;
+    arb_pending_t *rep = NULL;
+    uint32_t *ids;
+    arb_sub_t **slots;
+
+    if (!c || !entries || count == 0) return ARBITRO_ERR_ARG;
+    for (n = 0; n < count; n++)
+        if (!entries[n].cb) return ARBITRO_ERR_ARG;
+
+    /* Every entry needs a free subscription slot; claiming half a batch and
+       then failing would leave the caller with no way to tell which half. */
+    {
+        uint16_t free_slots = 0;
+        int i;
+        for (i = 0; i < ARB_MAX_SUBS; i++)
+            if (!c->subs[i].active) free_slots++;
+        if (free_slots < count) return ARBITRO_ERR_NOMEM;
+    }
+
+    /* Filters travel as JSON arrays of decimal bytes, so budget 4 chars per
+       byte plus the fixed keys. */
+    for (n = 0; n < count; n++)
+        cap += 64 + (size_t)entries[n].filter_len * 4;
+    body  = (uint8_t *)malloc(cap);
+    ids   = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
+    slots = (arb_sub_t **)malloc((size_t)count * sizeof(arb_sub_t *));
+    if (!body || !ids || !slots) {
+        free(body); free(ids); free(slots);
+        return ARBITRO_ERR_NOMEM;
+    }
+
+    arb__json_begin(&j, body, cap);
+    arb__json_key(&j, "entries");
+    arb__json_array_begin(&j);
+    for (n = 0; n < count; n++) {
+        if (c->next_sub_id == 0) c->next_sub_id = 1;
+        ids[n] = c->next_sub_id++;
+        arb__json_obj_begin(&j);
+        arb__json_key(&j, "consumer_id");
+        arb__json_u32(&j, consumer_id);
+        arb__json_key(&j, "subscription_id");
+        arb__json_u32(&j, ids[n]);
+        arb__json_key(&j, "filters");
+        arb__json_array_begin(&j);
+        if (entries[n].filter && entries[n].filter_len > 0)
+            arb__json_bytes(&j, entries[n].filter, entries[n].filter_len);
+        arb__json_array_end(&j);
+        arb__json_obj_end(&j);
+    }
+    arb__json_array_end(&j);
+    blen = arb__json_end(&j);
+    if (blen == 0) {
+        free(body); free(ids); free(slots);
+        return ARBITRO_ERR_TOOLARGE;
+    }
+
+    rc = arb__request_ok(c, ARB_ACT_SUBSCRIBE_BATCH, body, (uint32_t)blen, &rep);
+    free(body);
+    if (rc != ARBITRO_OK || !rep) {
+        /* Whole-frame refusal: no entry has a verdict of its own, so nothing
+           was subscribed. */
+        free(ids); free(slots);
+        return rc != ARBITRO_OK ? rc : ARBITRO_ERR_BROKER;
+    }
+
+    for (n = 0; n < count; n++) {
+        uint16_t code = arb__batch_reject_code(rep->rep_buf, rep->rep_len, ids[n]);
+        if (results) {
+            results[n].sub_id = ids[n];
+            results[n].code   = code;
+        }
+        if (code != 0) {
+            slots[n] = NULL;
+            refused = 1;
+            continue;
+        }
+        {
+            int i;
+            arb_sub_t *slot = NULL;
+            for (i = 0; i < ARB_MAX_SUBS; i++) {
+                if (!c->subs[i].active) { slot = &c->subs[i]; break; }
+            }
+            /* Free slots were counted before the round-trip, so this cannot
+               fail — but a NULL deref here would be a crash, not a bug report. */
+            if (!slot) { slots[n] = NULL; refused = 1; continue; }
+            slot->consumer_id = consumer_id;
+            slot->sub_id      = ids[n];
+            slot->stream_id   = stream_id;
+            slot->cb          = entries[n].cb;
+            slot->ud          = entries[n].userdata;
+            slot->filter_len  = 0;
+            if (entries[n].filter && entries[n].filter_len > 0) {
+                slot->filter_len = entries[n].filter_len <= ARBITRO_MAX_SUBJECT_LEN
+                                 ? entries[n].filter_len : ARBITRO_MAX_SUBJECT_LEN;
+                memcpy(slot->filter, entries[n].filter, slot->filter_len);
+            }
+            slot->kind   = arb__match_kind(slot->filter, slot->filter_len);
+            slot->active = 1;
+            slots[n] = slot;
+        }
+    }
+
+    free(ids); free(slots);
+    return refused ? ARBITRO_ERR_BROKER : ARBITRO_OK;
 }
 
 /* Never emit an empty group: the broker rejects it, and an empty group in

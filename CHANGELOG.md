@@ -7,6 +7,24 @@ numbers do not track theirs.
 
 ## [Unreleased]
 
+### Added — `arbitro_subscribe_batch`: N subscriptions in one round-trip
+
+- **`arbitro_subscribe_batch(c, stream_id, consumer_id, entries, count, results)`**
+  opens `count` filtered subscriptions on one consumer in a SINGLE round-trip.
+  `count` `arbitro_subscribe` calls cost `count` round-trips; the broker's
+  work per subscription is a filter check and a binding, so the trip is nearly
+  the whole cost. A NULL/zero-length entry filter inherits the consumer's.
+- `results` (optional, `count` slots) carries a per-entry verdict in request
+  order: `code == 0` means accepted. Returns `ARBITRO_OK` when every entry was
+  accepted, `ARBITRO_ERR_BROKER` when some were refused — the accepted ones
+  are live, `results` names the rest — or a negative error for a whole-frame
+  failure, in which case nothing was subscribed.
+- Free subscription slots are counted BEFORE the round-trip: claiming half a
+  batch and then running out would leave the caller with no way to tell which
+  half took.
+- Requires a broker with `SubscribeBatch` (0x0303). `arbitro_subscribe` and
+  `arbitro_subscribe_filter` are unchanged.
+
 ### Breaking
 
 - **`arbitro_msg_t.subject_hash` is now `sub_id`**, and likewise on

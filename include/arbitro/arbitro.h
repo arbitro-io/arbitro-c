@@ -157,6 +157,39 @@ int  arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
                               arbitro_msg_cb cb, void *userdata);
 int  arbitro_unsubscribe(arbitro_client_t *c, uint32_t consumer_id);
 
+/* One entry of arbitro_subscribe_batch. A NULL/zero-length filter inherits
+   the consumer's, exactly as arbitro_subscribe does. */
+typedef struct {
+    const uint8_t *filter;
+    uint16_t       filter_len;
+    arbitro_msg_cb cb;
+    void          *userdata;
+} arbitro_sub_entry_t;
+
+/* Per-entry verdict, filled in request order. code == 0 means accepted;
+   anything else is the wire error code that refused it (usually
+   ARBITRO_ERRCODE_INVALID_SUBSCRIPTION_FILTER). */
+typedef struct {
+    uint32_t sub_id;
+    uint16_t code;
+} arbitro_sub_result_t;
+
+/* Open `count` filtered subscriptions on one consumer in ONE round-trip.
+
+   `count` arbitro_subscribe calls cost `count` round-trips; the broker's work
+   per subscription is a filter check and a binding, so the trip is nearly the
+   whole cost. Every entry runs the same admission rules as a single subscribe.
+
+   `results` may be NULL; when given it must have `count` slots and is filled
+   in request order. Returns ARBITRO_OK when every entry was accepted,
+   ARBITRO_ERR_BROKER when some were refused (read `results` to learn which,
+   the accepted ones are live), or a negative error for a whole-frame failure,
+   in which case nothing was subscribed. */
+int  arbitro_subscribe_batch(arbitro_client_t *c, uint32_t stream_id,
+                             uint32_t consumer_id,
+                             const arbitro_sub_entry_t *entries, uint16_t count,
+                             arbitro_sub_result_t *results);
+
 typedef struct {
     const uint8_t *pattern;
     uint16_t       pattern_len;
