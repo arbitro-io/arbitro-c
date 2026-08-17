@@ -26,6 +26,16 @@ static void mk_name(char *dst, size_t cap, const char *tag) {
     snprintf(dst, cap, "t%s_%llu_%u", tag, (unsigned long long)nowms(), ++ctr);
 }
 
+/* Publish one byte to `<stream>.<tail>`. Every subject has to live under the
+   stream's own slice, so scoping it here keeps the length in step with the
+   pointer instead of leaving a hand-written literal length to drift. */
+static int pub(arbitro_client_t *c, uint32_t sid, const char *stream,
+               const char *tail, uint64_t *out_seq) {
+    const char *s = arb_scoped(stream, tail);
+    return arbitro_publish_sync(c, sid, (const uint8_t*)s, arb_slen(s),
+                                (const uint8_t*)"x", 1, out_seq);
+}
+
 static arbitro_client_t *connect_big(void) {
     arbitro_client_t *c = NULL;
     arbitro_opts_t o;
@@ -40,7 +50,7 @@ static arbitro_client_t *connect_big(void) {
 static volatile int hits = 0;
 static volatile int hits_a = 0, hits_b = 0, hits_c = 0;
 static volatile uint64_t last_seq = 0;
-static uint32_t last_subject_hash = 0;
+static uint32_t last_sub_id = 0;
 
 static void ack_cb(arbitro_msg_t *m, void *ud) {
     (void)ud; hits++; last_seq = m->seq;
@@ -100,7 +110,7 @@ static void copy_cb(arbitro_msg_t *m, void *ud) {
 
 static void capture_hash_cb(arbitro_msg_t *m, void *ud) {
     (void)ud; hits++; last_seq = m->seq;
-    last_subject_hash = m->subject_hash;
+    last_sub_id = m->sub_id;
     arbitro_msg_ack(m);
 }
 
@@ -113,11 +123,11 @@ static void t_subscribe_delivers_all_pending(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "all");
     T("10.2.1 subscribe delivers all pending");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
     for (int i = 0; i < 10; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
-    ccfg.name="cAll"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+        pub(c, sid, n, "a", NULL);
+    ccfg.name="cAll"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.deliver_policy = 0;
     arbitro_consumer_create(c, n, &ccfg, &cid);
@@ -136,11 +146,11 @@ static void t_subscribe_deliver_new_only(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "new");
     T("10.2.2 deliver New only");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
     for (int i = 0; i < 10; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
-    ccfg.name="cNew"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+        pub(c, sid, n, "a", NULL);
+    ccfg.name="cNew"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.deliver_policy = 1;
     arbitro_consumer_create(c, n, &ccfg, &cid);
@@ -160,11 +170,11 @@ static void t_subscribe_deliver_by_start_seq(void) {
     uint64_t seq = 0;
     char n[64]; mk_name(n, sizeof(n), "sseq");
     T("10.2.3 deliver ByStartSeq");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
     for (int i = 0; i < 20; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,&seq);
-    ccfg.name="cSseq"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+        pub(c, sid, n, "a", &seq);
+    ccfg.name="cSseq"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.deliver_policy = 2;
     /* header doesn't expose start_seq field — SKIP if API can't set */
@@ -186,17 +196,20 @@ static void t_subscribe_wildcard_single(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "wcS");
     T("10.2.4 wildcard single '*'");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cWcS"; ccfg.filter="orders.*"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cWcS"; ccfg.filter=arb_scoped(n, "orders.*"); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.new",10,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.paid",11,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.deep.nested",18,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"other",5,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "orders.new", NULL);
+    pub(c, sid, n, "orders.paid", NULL);
+    pub(c, sid, n, "orders.deep.nested", NULL);
+    pub(c, sid, n, "other", NULL);
     hits = 0;
-    arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)"orders.*", 8, ack_cb, NULL);
+    {
+        const char *f = arb_scoped(n, "orders.*");
+        arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)f, arb_slen(f), ack_cb, NULL);
+    }
     uint64_t t0 = nowms();
     while (nowms() - t0 < 1500) arbitro_client_poll(c, 100);
     if (hits == 2) OK(); else FAIL("expected 2, got %d", hits);
@@ -210,17 +223,20 @@ static void t_subscribe_wildcard_multi(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "wcM");
     T("10.2.5 wildcard multi '>'");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cWcM"; ccfg.filter="orders.>"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cWcM"; ccfg.filter=arb_scoped(n, "orders.>"); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.new",10,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.a.b",10,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"orders.a.b.c",12,(const uint8_t*)"x",1,NULL);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"other",5,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "orders.new", NULL);
+    pub(c, sid, n, "orders.a.b", NULL);
+    pub(c, sid, n, "orders.a.b.c", NULL);
+    pub(c, sid, n, "other", NULL);
     hits = 0;
-    arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)"orders.>", 8, ack_cb, NULL);
+    {
+        const char *f = arb_scoped(n, "orders.>");
+        arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)f, arb_slen(f), ack_cb, NULL);
+    }
     uint64_t t0 = nowms();
     while (nowms() - t0 < 1500) arbitro_client_poll(c, 100);
     if (hits == 3) OK(); else FAIL("expected 3, got %d", hits);
@@ -234,13 +250,13 @@ static void t_max_inflight_enforced(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "mi");
     T("10.2.6 max_inflight enforced (no ack)");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cMi"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cMi"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=10; ccfg.ack_wait_ms=60000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 20; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, noack_cb, NULL);
     uint64_t t0 = nowms();
@@ -256,12 +272,12 @@ static void t_ack_wait_redelivery(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "aw");
     T("10.2.7 ack_wait redelivery");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cAw"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cAw"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=800;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, noack_cb, NULL);
 
@@ -316,17 +332,17 @@ static void t_two_consumers_same_stream(void) {
     uint32_t sid_a, sid_b, cid_a, cid_b;
     char n[64]; mk_name(n, sizeof(n), "2c");
     T("10.2.9 two consumers same stream (independent)");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(ca, n, &scfg, &sid_a);
     arbitro_stream_upsert(cb, n, &scfg, &sid_b);
-    ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=200; ccfg.ack_wait_ms=30000;
     ccfg.name="c2a";
     arbitro_consumer_create(ca, n, &ccfg, &cid_a);
     ccfg.name="c2b";
     arbitro_consumer_create(cb, n, &ccfg, &cid_b);
     for (int i = 0; i < 20; i++)
-        arbitro_publish_sync(ca, sid_a, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(ca, sid_a, n, "a", NULL);
     hits_a = 0; hits_b = 0;
     arbitro_subscribe(ca, sid_a, cid_a, tag_cb_a, NULL);
     arbitro_subscribe(cb, sid_b, cid_b, tag_cb_b, NULL);
@@ -350,11 +366,11 @@ static void t_group_consumers_load_balance(void) {
     uint32_t sid_a, sid_b, sid_c, cid_a, cid_b, cid_c;
     char n[64]; mk_name(n, sizeof(n), "grp");
     T("10.2.10 group consumers load-balance");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(ca, n, &scfg, &sid_a);
     arbitro_stream_upsert(cb, n, &scfg, &sid_b);
     arbitro_stream_upsert(cc, n, &scfg, &sid_c);
-    ccfg.name="workers"; ccfg.filter=">"; ccfg.group="workers";
+    ccfg.name="workers"; ccfg.filter=arb_slice(n); ccfg.group="workers";
     ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.fanout = 0; /* Queue (the default) */
@@ -376,7 +392,10 @@ static void t_group_consumers_load_balance(void) {
 
     for (int i = 0; i < GRP_TOTAL; i++) {
         uint8_t payload = (uint8_t)i;
-        arbitro_publish_sync(ca, sid_a, (const uint8_t*)"a",1, &payload,1, NULL);
+        {
+            const char *s = arb_scoped(n, "a");
+            arbitro_publish_sync(ca, sid_a, (const uint8_t*)s, arb_slen(s), &payload,1, NULL);
+        }
     }
 
     uint64_t t0 = nowms();
@@ -413,18 +432,18 @@ static void t_fanout_mode(void) {
     uint32_t sid_a, sid_b, sid_c, cid_a, cid_b, cid_c;
     char n[64]; mk_name(n, sizeof(n), "fan");
     T("10.2.11 fanout mode — each gets 100%");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(ca, n, &scfg, &sid_a);
     arbitro_stream_upsert(cb, n, &scfg, &sid_b);
     arbitro_stream_upsert(cc, n, &scfg, &sid_c);
-    ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=200; ccfg.ack_wait_ms=30000;
     ccfg.fanout = 1; /* Fanout */
     ccfg.name="fA"; arbitro_consumer_create(ca, n, &ccfg, &cid_a);
     ccfg.name="fB"; arbitro_consumer_create(cb, n, &ccfg, &cid_b);
     ccfg.name="fC"; arbitro_consumer_create(cc, n, &ccfg, &cid_c);
     for (int i = 0; i < 20; i++)
-        arbitro_publish_sync(ca, sid_a, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(ca, sid_a, n, "a", NULL);
     hits_a = 0; hits_b = 0; hits_c = 0;
     arbitro_subscribe(ca, sid_a, cid_a, tag_cb_a, NULL);
     arbitro_subscribe(cb, sid_b, cid_b, tag_cb_b, NULL);
@@ -449,15 +468,18 @@ static void t_wildcard_no_match(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "wcN");
     T("10.2.12 wildcard no-match");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cWcN"; ccfg.filter="does.not.match.>"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cWcN"; ccfg.filter=arb_scoped(n, "does.not.match.>"); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 5; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"other.msg",9,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "other.msg", NULL);
     hits = 0;
-    arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)"does.not.match.>", 16, ack_cb, NULL);
+    {
+        const char *f = arb_scoped(n, "does.not.match.>");
+        arbitro_subscribe_filter(c, sid, cid, (const uint8_t*)f, arb_slen(f), ack_cb, NULL);
+    }
     uint64_t t0 = nowms();
     while (nowms() - t0 < 700) arbitro_client_poll(c, 100);
     if (hits == 0) OK(); else FAIL("expected 0, got %d", hits);
@@ -471,12 +493,12 @@ static void t_unsubscribe_stops_delivery(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "us");
     T("10.2.13 unsubscribe stops delivery");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cUs"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cUs"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
     uint64_t t0 = nowms();
@@ -488,7 +510,7 @@ static void t_unsubscribe_stops_delivery(void) {
     while (nowms() - t0 < 200) arbitro_client_poll(c, 50);
     int mid = hits;
     for (int i = 0; i < 5; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     t0 = nowms();
     while (nowms() - t0 < 700) arbitro_client_poll(c, 100);
     if (before >= 1 && hits == mid) OK();
@@ -504,18 +526,22 @@ static void t_subject_limits_multiple_patterns(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "sl2");
     T("10.2.14 subject_limits 2 patterns");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    lim[0].pattern=(const uint8_t*)"foo.>"; lim[0].pattern_len=5; lim[0].limit=1;
-    lim[1].pattern=(const uint8_t*)"bar.>"; lim[1].pattern_len=5; lim[1].limit=2;
-    ccfg.name="cSl2"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    {
+        const char *pf = arb_scoped(n, "foo.>");
+        const char *pb = arb_scoped(n, "bar.>");
+        lim[0].pattern=(const uint8_t*)pf; lim[0].pattern_len=arb_slen(pf); lim[0].limit=1;
+        lim[1].pattern=(const uint8_t*)pb; lim[1].pattern_len=arb_slen(pb); lim[1].limit=2;
+    }
+    ccfg.name="cSl2"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=1000; ccfg.ack_wait_ms=30000;
     ccfg.subject_limits = lim; ccfg.subject_limit_count = 2;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 5; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"foo.x",5,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "foo.x", NULL);
     for (int i = 0; i < 5; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"bar.x",5,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "bar.x", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, noack_cb, NULL);
     uint64_t t0 = nowms();
@@ -532,15 +558,18 @@ static void t_subject_limit_ignored_with_ack_none(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "sln");
     T("10.2.15 subject_limit + AckNone → all delivered");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    lim[0].pattern=(const uint8_t*)"foo.>"; lim[0].pattern_len=5; lim[0].limit=1;
-    ccfg.name="cSlN"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_NONE;
+    {
+        const char *pf = arb_scoped(n, "foo.>");
+        lim[0].pattern=(const uint8_t*)pf; lim[0].pattern_len=arb_slen(pf); lim[0].limit=1;
+    }
+    ccfg.name="cSlN"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_NONE;
     ccfg.max_inflight=1000; ccfg.ack_wait_ms=30000;
     ccfg.subject_limits = lim; ccfg.subject_limit_count = 1;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 5; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"foo.x",5,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "foo.x", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, noack_cb, NULL);
     uint64_t t0 = nowms();
@@ -558,13 +587,13 @@ static void t_single_ack_credits_inflight(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "cred");
     T("10.3.1 single ack credits inflight (100 iters)");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cCred"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cCred"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=1; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 100; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
     uint64_t t0 = nowms();
@@ -583,13 +612,13 @@ static void t_batch_ack_flushes_at_cap(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "bcap");
     T("10.3.2 batch ack auto-flushes at cap (256)");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cBcap"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cBcap"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=1000; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 260; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
     uint64_t t0 = nowms();
@@ -615,14 +644,14 @@ static void t_batch_ack_flushes_on_consumer_change(void) {
     uint32_t sid, cid1, cid2;
     char n[64]; mk_name(n, sizeof(n), "bcc");
     T("10.3.3 batch ack flushes on consumer change");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.name="cBcc1"; arbitro_consumer_create(c, n, &ccfg, &cid1);
     ccfg.name="cBcc2"; arbitro_consumer_create(c, n, &ccfg, &cid2);
     for (int i = 0; i < 10; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid1, ack_cb, NULL);
     arbitro_subscribe(c, sid, cid2, ack_cb, NULL);
@@ -642,13 +671,13 @@ static void t_client_flush_acks_manual(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "fam");
     T("10.3.4 flush_acks manual");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cFam"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cFam"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     for (int i = 0; i < 3; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+        pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
     uint64_t t0 = nowms();
@@ -667,13 +696,13 @@ static void t_nack_requeues_immediately(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "nq");
     T("10.3.5 nack requeues immediately");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cNq"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cNq"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     ccfg.max_deliver = 5;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "a", NULL);
     hits = 0;
     arbitro_subscribe(c, sid, cid, nack_cb, NULL);
     uint64_t t0 = nowms();
@@ -691,12 +720,12 @@ static void t_nack_with_delay(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "nkd");
     T("10.3.6 nack with delay");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cNkd"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cNkd"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "a", NULL);
     nd_hits = 0;
     arbitro_subscribe(c, sid, cid, nack_delay_cb, NULL);
 
@@ -755,12 +784,15 @@ static void t_msg_copy_outlives_delivery(void) {
     }
     arbitro_msg_owned_free(NULL);
 
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cCpy"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cCpy"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"cp.a",4, payload,5, NULL);
+    {
+        const char *s = arb_scoped(n, "cp.a");
+        arbitro_publish_sync(c, sid, (const uint8_t*)s, arb_slen(s), payload,5, NULL);
+    }
 
     hits = 0;
     g_owned_rc = -1;
@@ -773,13 +805,22 @@ static void t_msg_copy_outlives_delivery(void) {
 
     if (hits < 1) { FAIL("no delivery"); return; }
     if (g_owned_rc != ARBITRO_OK) { FAIL("msg_copy rc=%d", g_owned_rc); return; }
-    if (g_owned.subject_len != 4 || g_owned.data_len != 5) {
-        FAIL("subject_len=%u data_len=%u (want 4/5)",
-             g_owned.subject_len, g_owned.data_len);
-        arbitro_msg_owned_free(&g_owned);
-        return;
+    {
+        const char *want = arb_scoped(n, "cp.a");
+        uint16_t wlen = arb_slen(want);
+        if (g_owned.subject_len != wlen || g_owned.data_len != 5) {
+            FAIL("subject_len=%u data_len=%u (want %u/5)",
+                 g_owned.subject_len, g_owned.data_len, wlen);
+            arbitro_msg_owned_free(&g_owned);
+            return;
+        }
+        if (memcmp(g_owned.buf, want, wlen) != 0) {
+            FAIL("subject bytes did not survive the copy");
+            arbitro_msg_owned_free(&g_owned);
+            return;
+        }
     }
-    if (memcmp(g_owned.buf, "cp.a", 4) != 0 ||
+    if (0 ||
         memcmp(g_owned.buf + g_owned.subject_len + g_owned.reply_len,
                payload, 5) != 0) {
         FAIL("copied bytes differ after close");
@@ -799,14 +840,14 @@ static void t_ack_unknown_seq_ignored(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "auk");
     T("10.3.7 ack unknown seq ignored");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cAuk"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cAuk"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
+    pub(c, sid, n, "a", NULL);
     hits = 0;
-    last_subject_hash = 0;
+    last_sub_id = 0;
     arbitro_subscribe(c, sid, cid, capture_hash_cb, NULL);
     uint64_t t0 = nowms();
     while (hits < 1 && nowms() - t0 < 2000) arbitro_client_poll(c, 100);
@@ -815,7 +856,7 @@ static void t_ack_unknown_seq_ignored(void) {
     memset(&fake, 0, sizeof(fake));
     fake.client = c;
     fake.consumer_id = cid;
-    fake.subject_hash = last_subject_hash;
+    fake.sub_id = last_sub_id;
     fake.seq = 99999999ULL;
     arbitro_msg_ack(&fake);
     arbitro_client_flush_acks(c);
@@ -834,13 +875,13 @@ static void t_ack_after_unsubscribe_ignored(void) {
     uint32_t sid, cid;
     char n[64]; mk_name(n, sizeof(n), "aau");
     T("10.3.8 ack after unsubscribe ignored");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name="cAau"; ccfg.filter=">"; ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
+    ccfg.name="cAau"; ccfg.filter=arb_slice(n); ccfg.ack_policy=ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight=100; ccfg.ack_wait_ms=30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
-    arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
-    hits = 0; last_subject_hash = 0; last_seq = 0;
+    pub(c, sid, n, "a", NULL);
+    hits = 0; last_sub_id = 0; last_seq = 0;
     arbitro_subscribe(c, sid, cid, capture_hash_cb, NULL);
     uint64_t t0 = nowms();
     while (hits < 1 && nowms() - t0 < 2000) arbitro_client_poll(c, 100);
@@ -850,7 +891,7 @@ static void t_ack_after_unsubscribe_ignored(void) {
     memset(&fake, 0, sizeof(fake));
     fake.client = c;
     fake.consumer_id = cid;
-    fake.subject_hash = last_subject_hash;
+    fake.sub_id = last_sub_id;
     fake.seq = last_seq;
     arbitro_msg_ack(&fake);
     arbitro_client_flush_acks(c);

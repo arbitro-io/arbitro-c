@@ -63,16 +63,19 @@ int main(void) {
         return 1;
     }
     snprintf(n, sizeof(n), "alloc_hp_%llu", (unsigned long long)nowms());
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "cHp"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "cHp"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 60000; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     arbitro_subscribe(c, sid, cid, ack_cb, NULL);
 
+    const char *subj = arb_scoped(n, "hp.a");
+    uint16_t subj_len = arb_slen(subj);
+
     /* Warm every lazy path (stream-id cache, pending slots) before counting. */
     for (i = 0; i < 10; i++)
-        arbitro_publish(c, sid, (const uint8_t *)"hp.a", 4,
+        arbitro_publish(c, sid, (const uint8_t *)subj, subj_len,
                         (const uint8_t *)"xxxxxxxx", 8);
     arbitro_client_flush(c);
     {
@@ -86,7 +89,7 @@ int main(void) {
     g_counting = 1;
 
     for (i = 0; i < N; i++)
-        arbitro_publish(c, sid, (const uint8_t *)"hp.a", 4,
+        arbitro_publish(c, sid, (const uint8_t *)subj, subj_len,
                         (const uint8_t *)"xxxxxxxx", 8);
     arbitro_client_flush(c);
     {

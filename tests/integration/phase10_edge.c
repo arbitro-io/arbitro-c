@@ -152,10 +152,12 @@ static void test_null_output_params(void) {
     T("10.8.4 null_output_params");
     arbitro_client_t *c = connect_big();
     if (!c) { FAIL("connect failed"); return; }
-    arbitro_stream_cfg_t scfg = {0}; scfg.subject_filter = ">";
+    arbitro_stream_cfg_t scfg = {0};
     char n[64]; mk_stream_name(n, sizeof(n), "no");
+    scfg.subject_filter = arb_slice(n);
     int rc1 = arbitro_stream_upsert(c, n, &scfg, NULL);
-    int rc2 = arbitro_publish_sync(c, 0, (const uint8_t*)"a", 1,
+    const char *subj = arb_scoped(n, "a");
+    int rc2 = arbitro_publish_sync(c, 0, (const uint8_t*)subj, arb_slen(subj),
                                     (const uint8_t*)"x", 1, NULL);
     (void)rc1; (void)rc2;
     OK();
@@ -169,11 +171,13 @@ static void test_rapid_connect_close_loop(void) {
     for (int i = 0; i < 100; i++) {
         arbitro_client_t *c = connect_big();
         if (!c) { FAIL("iter %d connect failed", i); return; }
-        arbitro_stream_cfg_t scfg = {0}; scfg.subject_filter = ">";
+        arbitro_stream_cfg_t scfg = {0};
         char n[64]; mk_stream_name(n, sizeof(n), "rl");
         uint32_t sid = 0;
+        scfg.subject_filter = arb_slice(n);
         arbitro_stream_upsert(c, n, &scfg, &sid);
-        if (sid) arbitro_publish(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1);
+        const char *subj = arb_scoped(n, "a");
+        if (sid) arbitro_publish(c, sid, (const uint8_t*)subj, arb_slen(subj), (const uint8_t*)"x",1);
         arbitro_client_flush(c);
         arbitro_client_close(c);
     }
@@ -203,16 +207,19 @@ static void test_client_stop_from_callback(void) {
     T("10.8.6 client_stop_from_callback");
     arbitro_client_t *c = connect_big();
     if (!c) { FAIL("connect failed"); return; }
-    arbitro_stream_cfg_t scfg = {0}; scfg.subject_filter = ">";
+    arbitro_stream_cfg_t scfg = {0};
     arbitro_consumer_cfg_t ccfg = {0};
     uint32_t sid = 0, cid = 0;
     char n[64]; mk_stream_name(n, sizeof(n), "sc");
+    scfg.subject_filter = arb_slice(n);
     if (arbitro_stream_upsert(c, n, &scfg, &sid) != 0) {
         FAIL("stream_upsert"); arbitro_client_close(c); return;
     }
+    const char *subj = arb_scoped(n, "a");
     for (int i = 0; i < 3; i++)
-        arbitro_publish_sync(c, sid, (const uint8_t*)"a",1,(const uint8_t*)"x",1,NULL);
-    ccfg.name = "stopcb"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+        arbitro_publish_sync(c, sid, (const uint8_t*)subj, arb_slen(subj),
+                             (const uint8_t*)"x",1,NULL);
+    ccfg.name = "stopcb"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 100; ccfg.ack_wait_ms = 30000;
     if (arbitro_consumer_create(c, n, &ccfg, &cid) != 0) {
         FAIL("consumer_create"); arbitro_client_close(c); return;
@@ -287,7 +294,7 @@ static void test_stream_name_too_long_rejected(void) {
     char name[101];
     memset(name, 'x', 100);
     name[100] = 0;
-    arbitro_stream_cfg_t scfg = {0}; scfg.subject_filter = ">";
+    arbitro_stream_cfg_t scfg = {0}; scfg.subject_filter = arb_slice(name);
     uint32_t sid = 0;
     int rc = arbitro_stream_upsert(c, name, &scfg, &sid);
     if (rc < 0) OK();

@@ -93,13 +93,13 @@ static int stage0_cap_enforced(arbitro_client_t *c) {
     double t0;
 
     arbitro_subject_limit_t limits[1];
-    limits[0].pattern = (const uint8_t *)"orders.premium.>";
-    limits[0].pattern_len = 16;
+    limits[0].pattern = (const uint8_t *)"limits_cap.orders.premium.>";
+    limits[0].pattern_len = (uint16_t)strlen("limits_cap.orders.premium.>");
     limits[0].limit = PAT_PREMIUM_CAP;
 
     memset(payload, 0, sizeof(payload));
 
-    scfg.subject_filter = ">";
+    scfg.subject_filter = "limits_cap.>";
     rc = arbitro_stream_upsert(c, "limits_cap", &scfg, &stream_id);
     if (rc != ARBITRO_OK) {
         fprintf(stderr, "  stage0: stream_upsert: %s\n", arbitro_err_str(rc));
@@ -107,7 +107,7 @@ static int stage0_cap_enforced(arbitro_client_t *c) {
     }
 
     ccfg.name = "cap_enforced";
-    ccfg.filter = ">";
+    ccfg.filter = "limits_cap.>";
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10000;
     ccfg.ack_wait_ms = 30000;
@@ -127,8 +127,8 @@ static int stage0_cap_enforced(arbitro_client_t *c) {
             (size_t)total, sizeof(arbitro_batch_entry_t));
         int i;
         for (i = 0; i < total; i++) {
-            entries[i].subject = (const uint8_t *)"orders.premium.singleton";
-            entries[i].subject_len = 24;
+            entries[i].subject = (const uint8_t *)"limits_cap.orders.premium.singleton";
+            entries[i].subject_len = (uint16_t)strlen("limits_cap.orders.premium.singleton");
             entries[i].payload = payload;
             entries[i].payload_len = PAYLOAD_SIZE;
         }
@@ -186,13 +186,13 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
     char subject[64];
 
     arbitro_subject_limit_t limits[1];
-    limits[0].pattern = (const uint8_t *)"orders.premium.>";
-    limits[0].pattern_len = 16;
+    limits[0].pattern = (const uint8_t *)"limits_base.orders.premium.>";
+    limits[0].pattern_len = (uint16_t)strlen("limits_base.orders.premium.>");
     limits[0].limit = PAT_PREMIUM_CAP;
 
     memset(payload, 0, sizeof(payload));
 
-    scfg.subject_filter = ">";
+    scfg.subject_filter = "limits_base.>";
     rc = arbitro_stream_upsert(c, "limits_base", &scfg, &stream_id);
     if (rc != ARBITRO_OK) {
         fprintf(stderr, "  stage1: stream: %s\n", arbitro_err_str(rc));
@@ -200,7 +200,7 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
     }
 
     ccfg.name = "baseline";
-    ccfg.filter = ">";
+    ccfg.filter = "limits_base.>";
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10000;
     ccfg.ack_wait_ms = 30000;
@@ -219,7 +219,7 @@ static int stage1_baseline(arbitro_client_t *c, int iters, double *latencies) {
 
     for (i = 0; i < iters; i++) {
         double start_t;
-        snprintf(subject, sizeof(subject), "orders.premium.vip_%d", i);
+        snprintf(subject, sizeof(subject), "limits_base.orders.premium.vip_%d", i);
         delivered_count = 0;
         stop_at = 1;
 
@@ -251,16 +251,16 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
     char subject[64];
 
     arbitro_subject_limit_t limits[2];
-    limits[0].pattern = (const uint8_t *)"orders.basic.>";
-    limits[0].pattern_len = 14;
+    limits[0].pattern = (const uint8_t *)"limits_iso.orders.basic.>";
+    limits[0].pattern_len = (uint16_t)strlen("limits_iso.orders.basic.>");
     limits[0].limit = PAT_BASIC_CAP;
-    limits[1].pattern = (const uint8_t *)"orders.premium.>";
-    limits[1].pattern_len = 16;
+    limits[1].pattern = (const uint8_t *)"limits_iso.orders.premium.>";
+    limits[1].pattern_len = (uint16_t)strlen("limits_iso.orders.premium.>");
     limits[1].limit = PAT_PREMIUM_CAP;
 
     memset(payload, 0, sizeof(payload));
 
-    scfg.subject_filter = ">";
+    scfg.subject_filter = "limits_iso.>";
     rc = arbitro_stream_upsert(c, "limits_iso", &scfg, &stream_id);
     if (rc != ARBITRO_OK) {
         fprintf(stderr, "  stage2: stream: %s\n", arbitro_err_str(rc));
@@ -268,7 +268,7 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
     }
 
     ccfg.name = "isolation_tester";
-    ccfg.filter = ">";
+    ccfg.filter = "limits_iso.>";
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10000;
     ccfg.ack_wait_ms = 30000;
@@ -288,9 +288,9 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
     {
         arbitro_batch_entry_t *entries = (arbitro_batch_entry_t *)calloc(
             BASIC_BACKLOG, sizeof(arbitro_batch_entry_t));
-        char subjects[BASIC_BACKLOG][32];
+        char subjects[BASIC_BACKLOG][48];
         for (i = 0; i < BASIC_BACKLOG; i++) {
-            snprintf(subjects[i], sizeof(subjects[i]), "orders.basic.user_%d", i);
+            snprintf(subjects[i], sizeof(subjects[i]), "limits_iso.orders.basic.user_%d", i);
             entries[i].subject = (const uint8_t *)subjects[i];
             entries[i].subject_len = (uint16_t)strlen(subjects[i]);
             entries[i].payload = payload;
@@ -321,7 +321,7 @@ static int stage2_isolated(arbitro_client_t *c, int iters, double *latencies) {
 
     for (i = 0; i < iters; i++) {
         double start_t;
-        snprintf(subject, sizeof(subject), "orders.premium.vip_%d", i);
+        snprintf(subject, sizeof(subject), "limits_iso.orders.premium.vip_%d", i);
         delivered_count = 0;
         stop_at = 1;
 
@@ -353,14 +353,14 @@ static int stage4_dynamic(arbitro_client_t *c, int n_users) {
     double msgs_per_sec, ns_per_msg;
 
     arbitro_subject_limit_t limits[1];
-    limits[0].pattern = (const uint8_t *)"notif.user.>";
-    limits[0].pattern_len = 12;
+    limits[0].pattern = (const uint8_t *)"limits_dyn.notif.user.>";
+    limits[0].pattern_len = (uint16_t)strlen("limits_dyn.notif.user.>");
     limits[0].limit = PAT_DYNAMIC_CAP;
 
     if (n_users > 1000) n_users = 1000;
     memset(payload, 0, sizeof(payload));
 
-    scfg.subject_filter = ">";
+    scfg.subject_filter = "limits_dyn.>";
     rc = arbitro_stream_upsert(c, "limits_dyn", &scfg, &stream_id);
     if (rc != ARBITRO_OK) {
         fprintf(stderr, "  stage4: stream: %s\n", arbitro_err_str(rc));
@@ -368,7 +368,7 @@ static int stage4_dynamic(arbitro_client_t *c, int n_users) {
     }
 
     ccfg.name = "dyn_consumer";
-    ccfg.filter = ">";
+    ccfg.filter = "limits_dyn.>";
     ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 60000;
     ccfg.ack_wait_ms = 30000;
@@ -384,9 +384,9 @@ static int stage4_dynamic(arbitro_client_t *c, int n_users) {
     {
         arbitro_batch_entry_t *entries = (arbitro_batch_entry_t *)calloc(
             (size_t)n_users, sizeof(arbitro_batch_entry_t));
-        char (*subjects)[32] = (char (*)[32])calloc((size_t)n_users, 32);
+        char (*subjects)[48] = (char (*)[48])calloc((size_t)n_users, 48);
         for (i = 0; i < n_users; i++) {
-            snprintf(subjects[i], 32, "notif.user.%d", i);
+            snprintf(subjects[i], 48, "limits_dyn.notif.user.%d", i);
             entries[i].subject = (const uint8_t *)subjects[i];
             entries[i].subject_len = (uint16_t)strlen(subjects[i]);
             entries[i].payload = payload;

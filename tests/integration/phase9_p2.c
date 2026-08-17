@@ -32,11 +32,12 @@ static void test_batch_sync(void) {
     snprintf(sname, sizeof(sname), "t14_bsync_%llu", (unsigned long long)nowms());
     T("test_batch_sync");
     arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(sname);
     arbitro_stream_upsert(c, sname, &scfg, &sid);
+    const char *subj = arb_scoped(sname, "a.b");
     for (int i = 0; i < 3; i++) {
-        entries[i].subject = (const uint8_t*)"a.b";
-        entries[i].subject_len = 3;
+        entries[i].subject = (const uint8_t*)subj;
+        entries[i].subject_len = arb_slen(subj);
         entries[i].msg_id = NULL; entries[i].msg_id_len = 0;
         entries[i].payload = p; entries[i].payload_len = 8;
     }
@@ -53,12 +54,13 @@ static void test_sync_with_id(void) {
     snprintf(sname, sizeof(sname), "t15_swid_%llu", (unsigned long long)nowms());
     T("test_sync_with_id");
     arbitro_client_connect(arb_test_addr(), arb_test_port(), NULL, &c);
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(sname);
     arbitro_stream_upsert(c, sname, &scfg, &sid);
-    rc = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"x",1,
+    const char *subj = arb_scoped(sname, "x");
+    rc = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                        (const uint8_t*)"id1",3,(const uint8_t*)"a",1,&s1);
     if (rc != ARBITRO_OK) { FAIL("first rc=%d", rc); arbitro_client_close(c); return; }
-    rc = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"x",1,
+    rc = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                        (const uint8_t*)"id2",3,(const uint8_t*)"b",1,&s2);
     if (rc == ARBITRO_OK && s2 > s1) OK();
     else FAIL("second rc=%d s1=%llu s2=%llu", rc, (unsigned long long)s1, (unsigned long long)s2);

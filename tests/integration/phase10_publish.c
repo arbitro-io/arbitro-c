@@ -25,6 +25,13 @@ static void mk_stream_name(char *dst, size_t cap, const char *tag) {
     snprintf(dst, cap, "t%s_%llu", tag, (unsigned long long)nowms());
 }
 
+static int pub(arbitro_client_t *c, uint32_t sid, const char *stream,
+               const char *tail, const char *payload, uint64_t *out_seq) {
+    const char *s = arb_scoped(stream, tail);
+    return arbitro_publish_sync(c, sid, (const uint8_t*)s, arb_slen(s),
+                                (const uint8_t*)payload, 1, out_seq);
+}
+
 static arbitro_client_t *connect_big(void) {
     arbitro_client_t *c; arbitro_opts_t o;
     arbitro_opts_init(&o);
@@ -61,10 +68,11 @@ static void test_publish_fire_forget(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "ff");
     T("10.1.1 publish_fire_forget");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
+    const char *subj = arb_scoped(n, "a");
     for (int i = 0; i < 100; i++)
-        arbitro_publish(c, sid, (const uint8_t*)"a", 1, (const uint8_t*)"x", 1);
+        arbitro_publish(c, sid, (const uint8_t*)subj, arb_slen(subj), (const uint8_t*)"x", 1);
     arbitro_client_flush(c);
     usleep(300000);
     arbitro_stream_info_t info;
@@ -80,12 +88,11 @@ static void test_publish_sync_returns_seq(void) {
     uint64_t last = 0, cur;
     char n[64]; mk_stream_name(n, sizeof(n), "sq");
     T("10.1.2 publish_sync returns increasing seq");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
     for (int i = 0; i < 10; i++) {
         cur = 0;
-        int rc = arbitro_publish_sync(c, sid, (const uint8_t*)"a", 1,
-                                      (const uint8_t*)"x", 1, &cur);
+        int rc = pub(c, sid, n, "a", "x", &cur);
         if (rc || cur <= last) {
             FAIL("iter %d rc=%d cur=%llu last=%llu", i, rc,
                  (unsigned long long)cur, (unsigned long long)last);
@@ -103,15 +110,16 @@ static void test_publish_with_id_dedup_within_window(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "dw");
     T("10.1.3 publish_with_id dedup within window");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     scfg.idempotency_window_ms = 5000;
     int rcu = arbitro_stream_upsert(c, n, &scfg, &sid);
     if (rcu) { FAIL("upsert rc=%d", rcu); arbitro_client_close(c); return; }
+    const char *subj = arb_scoped(n, "a");
     uint64_t s1 = 0, s2 = 0;
-    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid1", 4,
                                           (const uint8_t*)"x", 1, &s1);
-    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid1", 4,
                                           (const uint8_t*)"x", 1, &s2);
     /* Broker semantic: duplicate msg_id → IdempotencyDuplicate (ERR_BROKER),
@@ -128,16 +136,17 @@ static void test_publish_with_id_no_dedup_after_window(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "nd");
     T("10.1.4 publish_with_id no dedup after window");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     scfg.idempotency_window_ms = 500;
     int rcu = arbitro_stream_upsert(c, n, &scfg, &sid);
     if (rcu) { FAIL("upsert rc=%d", rcu); arbitro_client_close(c); return; }
+    const char *subj = arb_scoped(n, "a");
     uint64_t s1 = 0, s2 = 0;
-    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid2", 4,
                                           (const uint8_t*)"x", 1, &s1);
     usleep(1500000); /* > 3x window */
-    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid2", 4,
                                           (const uint8_t*)"x", 1, &s2);
     /* Broker lazy-expires idempotency entries; after window+eviction, the
@@ -156,14 +165,15 @@ static void test_publish_sync_with_id(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "swi");
     T("10.1.5 publish_sync_with_id");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     scfg.idempotency_window_ms = 5000;
     arbitro_stream_upsert(c, n, &scfg, &sid);
+    const char *subj = arb_scoped(n, "a");
     uint64_t s1 = 0, s2 = 0;
-    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r1 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid5", 4,
                                           (const uint8_t*)"x", 1, &s1);
-    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)"a", 1,
+    int r2 = arbitro_publish_sync_with_id(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           (const uint8_t*)"mid5", 4,
                                           (const uint8_t*)"x", 1, &s2);
     /* Same semantic as 10.1.3: duplicate → ERR_BROKER. */
@@ -180,15 +190,16 @@ static void test_publish_delayed_arrives_late(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "dl");
     T("10.1.6 publish_delayed arrives late");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "dl_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "dl_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0; first_deliver_ms = 0;
     arbitro_subscribe(c, sid, cid, count_cb, NULL);
+    const char *subj = arb_scoped(n, "a");
     uint64_t t_pub = nowms();
-    arbitro_publish_delayed(c, sid, (const uint8_t*)"a", 1,
+    arbitro_publish_delayed(c, sid, (const uint8_t*)subj, arb_slen(subj),
                             (const uint8_t*)"x", 1, 500);
     arbitro_client_flush(c);
     uint64_t t0 = nowms();
@@ -206,15 +217,16 @@ static void test_publish_delayed_zero_ms(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "dz");
     T("10.1.7 publish_delayed zero ms");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "dz_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "dz_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0; first_deliver_ms = 0;
     arbitro_subscribe(c, sid, cid, count_cb, NULL);
+    const char *subj = arb_scoped(n, "a");
     uint64_t t_pub = nowms();
-    arbitro_publish_delayed(c, sid, (const uint8_t*)"a", 1,
+    arbitro_publish_delayed(c, sid, (const uint8_t*)subj, arb_slen(subj),
                             (const uint8_t*)"x", 1, 0);
     arbitro_client_flush(c);
     uint64_t t0 = nowms();
@@ -232,14 +244,15 @@ static void test_publish_delayed_large_ms(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "dg");
     T("10.1.8 publish_delayed large ms — no delivery in 1s");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "dg_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "dg_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0;
     arbitro_subscribe(c, sid, cid, count_cb, NULL);
-    arbitro_publish_delayed(c, sid, (const uint8_t*)"a", 1,
+    const char *subj = arb_scoped(n, "a");
+    arbitro_publish_delayed(c, sid, (const uint8_t*)subj, arb_slen(subj),
                             (const uint8_t*)"x", 1, 10000);
     arbitro_client_flush(c);
     uint64_t t0 = nowms();
@@ -255,9 +268,9 @@ static void test_publish_with_headers_survives_roundtrip(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "hd");
     T("10.1.9 publish_with_headers round-trip");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "hd_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "hd_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0; captured_len = 0;
@@ -270,7 +283,8 @@ static void test_publish_with_headers_survives_roundtrip(void) {
     h[2].key = (const uint8_t*)"k3"; h[2].key_len = 2;
     h[2].val = (const uint8_t*)"v3"; h[2].val_len = 2;
     const uint8_t body[] = "HELLO";
-    int rc = arbitro_publish_with_headers(c, sid, (const uint8_t*)"a", 1,
+    const char *subj = arb_scoped(n, "a");
+    int rc = arbitro_publish_with_headers(c, sid, (const uint8_t*)subj, arb_slen(subj),
                                           h, 3, body, 5);
     arbitro_client_flush(c);
     uint64_t t0 = nowms();
@@ -290,18 +304,19 @@ static void test_publish_batch_atomic(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "ba");
     T("10.1.10 publish_batch atomic 100 entries");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
+    const char *subj = arb_scoped(n, "a");
     arbitro_batch_entry_t e[100];
     for (int i = 0; i < 100; i++) {
-        e[i].subject = (const uint8_t*)"a"; e[i].subject_len = 1;
+        e[i].subject = (const uint8_t*)subj; e[i].subject_len = arb_slen(subj);
         e[i].msg_id = NULL; e[i].msg_id_len = 0;
         e[i].payload = (const uint8_t*)"x"; e[i].payload_len = 1;
     }
     uint64_t fseq = 0;
     int rc = arbitro_publish_batch(c, sid, e, 100, &fseq);
     if (rc) { FAIL("batch rc=%d", rc); arbitro_client_close(c); return; }
-    ccfg.name = "ba_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "ba_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 200; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0;
@@ -319,11 +334,12 @@ static void test_publish_batch_returns_first_seq(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "bfs");
     T("10.1.11 publish_batch first_seq > 0");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
+    const char *subj = arb_scoped(n, "a");
     arbitro_batch_entry_t e[10];
     for (int i = 0; i < 10; i++) {
-        e[i].subject = (const uint8_t*)"a"; e[i].subject_len = 1;
+        e[i].subject = (const uint8_t*)subj; e[i].subject_len = arb_slen(subj);
         e[i].msg_id = NULL; e[i].msg_id_len = 0;
         e[i].payload = (const uint8_t*)"x"; e[i].payload_len = 1;
     }
@@ -340,20 +356,21 @@ static void test_publish_batch_mixed_dedup(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "bmd");
     T("10.1.12 publish_batch mixed dedup");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     scfg.idempotency_window_ms = 5000;
     arbitro_stream_upsert(c, n, &scfg, &sid);
+    const char *subj = arb_scoped(n, "a");
     arbitro_batch_entry_t e[4];
-    e[0].subject = (const uint8_t*)"a"; e[0].subject_len = 1;
+    e[0].subject = (const uint8_t*)subj; e[0].subject_len = arb_slen(subj);
     e[0].msg_id = (const uint8_t*)"id1"; e[0].msg_id_len = 3;
     e[0].payload = (const uint8_t*)"x"; e[0].payload_len = 1;
-    e[1].subject = (const uint8_t*)"a"; e[1].subject_len = 1;
+    e[1].subject = (const uint8_t*)subj; e[1].subject_len = arb_slen(subj);
     e[1].msg_id = NULL; e[1].msg_id_len = 0;
     e[1].payload = (const uint8_t*)"y"; e[1].payload_len = 1;
-    e[2].subject = (const uint8_t*)"a"; e[2].subject_len = 1;
+    e[2].subject = (const uint8_t*)subj; e[2].subject_len = arb_slen(subj);
     e[2].msg_id = (const uint8_t*)"id2"; e[2].msg_id_len = 3;
     e[2].payload = (const uint8_t*)"z"; e[2].payload_len = 1;
-    e[3].subject = (const uint8_t*)"a"; e[3].subject_len = 1;
+    e[3].subject = (const uint8_t*)subj; e[3].subject_len = arb_slen(subj);
     e[3].msg_id = NULL; e[3].msg_id_len = 0;
     e[3].payload = (const uint8_t*)"w"; e[3].payload_len = 1;
     uint64_t fseq = 0;
@@ -370,14 +387,15 @@ static void test_publish_empty_payload(void) {
     uint32_t sid, cid;
     char n[64]; mk_stream_name(n, sizeof(n), "ep");
     T("10.1.13 publish_empty_payload delivers");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    ccfg.name = "ep_c"; ccfg.filter = ">"; ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
+    ccfg.name = "ep_c"; ccfg.filter = arb_slice(n); ccfg.ack_policy = ARBITRO_ACK_EXPLICIT;
     ccfg.max_inflight = 10; ccfg.ack_wait_ms = 30000;
     arbitro_consumer_create(c, n, &ccfg, &cid);
     hits = 0;
     arbitro_subscribe(c, sid, cid, count_cb, NULL);
-    int rc = arbitro_publish(c, sid, (const uint8_t*)"a", 1, NULL, 0);
+    const char *subj = arb_scoped(n, "a");
+    int rc = arbitro_publish(c, sid, (const uint8_t*)subj, arb_slen(subj), NULL, 0);
     arbitro_client_flush(c);
     uint64_t t0 = nowms();
     while (hits < 1 && nowms() - t0 < 2000) arbitro_client_poll(c, 100);
@@ -392,10 +410,13 @@ static void test_publish_max_subject_len(void) {
     arbitro_stream_cfg_t scfg = {0}; uint32_t sid;
     char n[64]; mk_stream_name(n, sizeof(n), "ml");
     T("10.1.14 publish 255-byte subject succeeds");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
     uint8_t subj[255];
-    memset(subj, 'a', sizeof(subj));
+    size_t plen = strlen(n);
+    memcpy(subj, n, plen);
+    subj[plen] = '.';
+    memset(subj + plen + 1, 'a', sizeof(subj) - plen - 1);
     int rc = arbitro_publish(c, sid, subj, 255, (const uint8_t*)"x", 1);
     arbitro_client_flush(c);
     if (rc == 0) OK(); else FAIL("rc=%d", rc);
@@ -413,9 +434,10 @@ static void test_publish_rejects_toolarge(void) {
     char n[64]; mk_stream_name(n, sizeof(n), "tl");
     uint8_t *big = calloc(8192, 1);
     T("10.1.15 publish rejects toolarge");
-    scfg.subject_filter = ">";
+    scfg.subject_filter = arb_slice(n);
     arbitro_stream_upsert(c, n, &scfg, &sid);
-    int rc = arbitro_publish(c, sid, (const uint8_t*)"a", 1, big, 8192);
+    const char *subj = arb_scoped(n, "a");
+    int rc = arbitro_publish(c, sid, (const uint8_t*)subj, arb_slen(subj), big, 8192);
     if (rc == ARBITRO_ERR_TOOLARGE) OK();
     else FAIL("rc=%d (expected TOOLARGE)", rc);
     free(big);
