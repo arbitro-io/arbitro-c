@@ -71,7 +71,11 @@ typedef struct arbitro_msg {
     uint32_t          data_len;
     uint64_t          seq;
     uint32_t          consumer_id;
-    uint32_t          subject_hash;
+    /* The subscription this copy was delivered for. Several subscriptions
+       may share a consumer, and the broker opens one pending per
+       subscription, so an ack that carries the wrong id leaves the real one
+       outstanding until ack_wait fires. */
+    uint32_t          sub_id;
 } arbitro_msg_t;
 
 typedef void (*arbitro_msg_cb)(arbitro_msg_t *msg, void *userdata);
@@ -295,7 +299,7 @@ typedef struct {
     uint32_t data_len;
     uint64_t seq;
     uint32_t consumer_id;
-    uint32_t subject_hash;
+    uint32_t sub_id;
 } arbitro_msg_owned_t;
 
 int  arbitro_msg_copy(const arbitro_msg_t *msg, arbitro_msg_owned_t *out);
@@ -982,12 +986,20 @@ ARB__UNUSED static void arb__net_close(arb_sock_t s) {
 #define ARB_MAX_PENDING   64
 #define ARB_MAX_STREAMS   16
 
+/* Filter shapes, cheapest test first. Classified once at subscribe time so
+   the delivery path branches on a byte instead of rescanning for wildcards. */
+#define ARB_MATCH_ALL     0
+#define ARB_MATCH_EXACT   1
+#define ARB_MATCH_PATTERN 2
+
 typedef struct {
     uint32_t consumer_id;
+    uint32_t sub_id;
     uint32_t stream_id;
     arbitro_msg_cb cb;
     void *ud;
     int active;
+    uint8_t  kind;
     uint8_t  filter[ARBITRO_MAX_SUBJECT_LEN];
     uint16_t filter_len;
 } arb_sub_t;
@@ -1090,6 +1102,11 @@ struct arbitro_client {
     uint32_t     nack_count;
     uint32_t     nack_consumer_id;
 
+    /* Client-owned and never reused: the broker keys its pendings by this,
+       so handing a fresh subscription an id a dead one still owns would ack
+       the wrong messages. Starts at 1 — 0 is the "unset" the broker sees
+       from a client that does not name its subscriptions. */
+    uint32_t     next_sub_id;
     arb_sub_t    subs[ARB_MAX_SUBS];
     arb_cron_t   crons[ARB_MAX_CRONS];
     arb_pending_t pending[ARB_MAX_PENDING];
@@ -1405,6 +1422,7 @@ int arbitro_client_connect(const char *host, uint16_t port,
 }
 
 static int arb__ack_flush(arbitro_client_t *c);
+static uint8_t arb__match_kind(const uint8_t *filter, uint16_t len);
 static int arb__nack_flush(arbitro_client_t *c);
 static int arb_ackrel_record(arbitro_client_t *c, uint32_t consumer_id, uint64_t seq);
 static uint32_t arb_ackrel_purge_up_to(arbitro_client_t *c, uint32_t consumer_id, uint64_t cursor);
@@ -2038,6 +2056,7 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
                              arbitro_msg_cb cb, void *userdata) {
     int i;
     arb_sub_t *slot = NULL;
+    uint32_t sub_id;
     if (!c || !cb) return ARBITRO_ERR_ARG;
     uint8_t body[1024];
     arb_json_t j;
@@ -2048,11 +2067,14 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
     }
     if (!slot) return ARBITRO_ERR_NOMEM;
 
+    if (c->next_sub_id == 0) c->next_sub_id = 1;
+    sub_id = c->next_sub_id++;
+
     arb__json_begin(&j, body, sizeof(body));
     arb__json_key(&j, "consumer_id");
     arb__json_u32(&j, consumer_id);
     arb__json_key(&j, "subscription_id");
-    arb__json_u32(&j, 0);
+    arb__json_u32(&j, sub_id);
     arb__json_key(&j, "filters");
     arb__json_array_begin(&j);
     if (filter && filter_len > 0)
@@ -2067,6 +2089,7 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
     }
 
     slot->consumer_id = consumer_id;
+    slot->sub_id = sub_id;
     slot->stream_id = stream_id;
     slot->cb = cb;
     slot->ud = userdata;
@@ -2076,6 +2099,7 @@ int arbitro_subscribe_filter(arbitro_client_t *c, uint32_t stream_id,
                           ? filter_len : ARBITRO_MAX_SUBJECT_LEN;
         memcpy(slot->filter, filter, slot->filter_len);
     }
+    slot->kind = arb__match_kind(slot->filter, slot->filter_len);
     slot->active = 1;
     return ARBITRO_OK;
 }
@@ -2216,7 +2240,7 @@ int arbitro_msg_ack(arbitro_msg_t *msg) {
     c->ack_consumer_id = msg->consumer_id;
     slot = c->ack_buf + 8 + c->ack_count * 16;
     arb__put_u64(slot + 0, msg->seq);
-    arb__put_u32(slot + 8, msg->subject_hash);
+    arb__put_u32(slot + 8, msg->sub_id);
     arb__put_u32(slot + 12, 0);
     c->ack_count++;
 
@@ -2232,7 +2256,7 @@ int arbitro_msg_nack(arbitro_msg_t *msg) {
 
     arb__hdr_write(frame, ARB_ACT_NACK, 0, 0, 16, c->next_seq++);
     arb__put_u32(frame + ARB_HDR_LEN + 0, msg->consumer_id);
-    arb__put_u32(frame + ARB_HDR_LEN + 4, msg->subject_hash);
+    arb__put_u32(frame + ARB_HDR_LEN + 4, msg->sub_id);
     arb__put_u64(frame + ARB_HDR_LEN + 8, msg->seq);
 
     c->m_nacks_sent++;
@@ -2278,7 +2302,7 @@ int arbitro_msg_nack_delay(arbitro_msg_t *msg, uint32_t delay_ms) {
     c->nack_consumer_id = msg->consumer_id;
     slot = c->nack_buf + 8 + c->nack_count * 16;
     arb__put_u64(slot + 0, msg->seq);
-    arb__put_u32(slot + 8, msg->subject_hash);
+    arb__put_u32(slot + 8, msg->sub_id);
     arb__put_u32(slot + 12, delay_ms);
     c->nack_count++;
 
@@ -2466,37 +2490,107 @@ static ARB__UNUSED int arb__ackrel_sweep(arbitro_client_t *c) {
 /* Deliver dispatch (hot path, zero copy)                                     */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
-static int arb__find_sub(arbitro_client_t *c, uint32_t consumer_id,
-                         arbitro_msg_cb *out_cb, void **out_ud) {
-    int i;
-    for (i = 0; i < ARB_MAX_SUBS; i++) {
-        if (c->subs[i].active && c->subs[i].consumer_id == consumer_id) {
-            *out_cb = c->subs[i].cb;
-            *out_ud = c->subs[i].ud;
-            return 1;
+static uint8_t arb__match_kind(const uint8_t *filter, uint16_t len) {
+    uint16_t i;
+    /* A bare `>` is the catch-all: classifying it as a pattern would walk
+       tokens to reach the same answer. */
+    if (len == 0 || (len == 1 && filter[0] == '>')) return ARB_MATCH_ALL;
+    for (i = 0; i < len; i++)
+        if (filter[i] == '*' || filter[i] == '>') return ARB_MATCH_PATTERN;
+    return ARB_MATCH_EXACT;
+}
+
+/* Token walk against `*` (one token) and `>` (one or more trailing tokens).
+   `>` requires at least one token, so `orders.>` does not match `orders`. */
+static int arb__pattern_match(const uint8_t *pat, uint16_t plen,
+                              const uint8_t *subj, uint16_t slen) {
+    uint16_t p = 0, s = 0;
+
+    while (p < plen) {
+        uint16_t pe = p, se = s;
+        while (pe < plen && pat[pe] != '.') pe++;
+
+        if (pe - p == 1 && pat[p] == '>') return s < slen;
+
+        while (se < slen && subj[se] != '.') se++;
+        if (s >= slen) return 0;
+
+        if (!(pe - p == 1 && pat[p] == '*')) {
+            if (pe - p != se - s) return 0;
+            if (memcmp(pat + p, subj + s, (size_t)(pe - p)) != 0) return 0;
         }
+        p = (pe < plen) ? pe + 1 : pe;
+        s = (se < slen) ? se + 1 : se;
+        if (p >= plen && se < slen) return 0;
     }
-    return 0;
+    return s >= slen;
+}
+
+static int arb__accepts(const arb_sub_t *sub, const uint8_t *subj, uint16_t slen) {
+    switch (sub->kind) {
+    case ARB_MATCH_ALL:   return 1;
+    case ARB_MATCH_EXACT: return sub->filter_len == slen &&
+                                 memcmp(sub->filter, subj, slen) == 0;
+    default:              return arb__pattern_match(sub->filter, sub->filter_len,
+                                                    subj, slen);
+    }
+}
+
+static int arb__find_sub_by_id(arbitro_client_t *c, uint32_t sub_id) {
+    int i;
+    for (i = 0; i < ARB_MAX_SUBS; i++)
+        if (c->subs[i].active && c->subs[i].sub_id == sub_id) return i;
+    return -1;
+}
+
+/* The broker sends ONE wire copy per (connection, consumer) and stamps it
+   with the subscription that won the round. Siblings sharing that consumer
+   never see their own copy, so the client hands them this one — each with
+   its own id, because the broker opened a pending per subscription.
+   A lone subscription skips the filter: the broker already matched it, and
+   re-testing would let any disagreement between the two matchers drop a
+   message the broker considers delivered. */
+static void arb__fanout(arbitro_client_t *c, int owner, arbitro_msg_t *msg) {
+    uint32_t consumer_id = c->subs[owner].consumer_id;
+    int i, siblings = 0;
+
+    for (i = 0; i < ARB_MAX_SUBS; i++)
+        if (c->subs[i].active && c->subs[i].consumer_id == consumer_id)
+            siblings++;
+
+    if (siblings == 1) {
+        msg->sub_id = c->subs[owner].sub_id;
+        c->subs[owner].cb(msg, c->subs[owner].ud);
+        return;
+    }
+
+    for (i = 0; i < ARB_MAX_SUBS; i++) {
+        arb_sub_t *s = &c->subs[i];
+        if (!s->active || s->consumer_id != consumer_id) continue;
+        if (!arb__accepts(s, msg->subject, msg->subject_len)) continue;
+        msg->sub_id = s->sub_id;
+        s->cb(msg, s->ud);
+    }
 }
 
 static int arb__dispatch_deliver_single(arbitro_client_t *c, uint64_t deliver_seq,
                                         const uint8_t *body, uint32_t body_len) {
-    uint32_t consumer_id, subject_hash;
+    uint32_t consumer_id, sub_id;
     uint16_t subject_len;
     uint32_t payload_off;
-    arbitro_msg_cb cb;
-    void *ud;
+    int owner;
 
     if (body_len < 12) return ARBITRO_ERR_PROTOCOL;
 
     consumer_id  = arb__get_u32(body + 0);
-    subject_hash = arb__get_u32(body + 4);
+    sub_id       = arb__get_u32(body + 4);
     subject_len  = arb__get_u16(body + 8);
 
     payload_off = 12 + (uint32_t)subject_len;
     if (payload_off > body_len) return ARBITRO_ERR_PROTOCOL;
 
-    if (arb__find_sub(c, consumer_id, &cb, &ud)) {
+    owner = arb__find_sub_by_id(c, sub_id);
+    if (owner >= 0) {
         arbitro_msg_t msg;
         msg.client       = c;
         msg.subject      = body + 12;
@@ -2507,8 +2601,8 @@ static int arb__dispatch_deliver_single(arbitro_client_t *c, uint64_t deliver_se
         msg.data_len     = body_len - payload_off;
         msg.seq          = deliver_seq;
         msg.consumer_id  = consumer_id;
-        msg.subject_hash = subject_hash;
-        cb(&msg, ud);
+        msg.sub_id       = sub_id;
+        arb__fanout(c, owner, &msg);
     }
     return ARBITRO_OK;
 }
@@ -2522,12 +2616,11 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
     count = arb__get_u16(body);
 
     for (i = 0; i < count; i++) {
-        uint32_t consumer_id, data_len, subject_hash;
+        uint32_t consumer_id, data_len, sub_id;
         uint16_t subject_len, reply_len;
         uint64_t seq;
         uint64_t entry_end;
-        arbitro_msg_cb cb;
-        void *ud;
+        int owner;
 
         if ((uint64_t)off + 24u > (uint64_t)body_len) return ARBITRO_ERR_PROTOCOL;
 
@@ -2536,7 +2629,7 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
         subject_len  = arb__get_u16(body + off + 12);
         reply_len    = arb__get_u16(body + off + 14);
         data_len     = arb__get_u32(body + off + 16);
-        subject_hash = arb__get_u32(body + off + 20);
+        sub_id = arb__get_u32(body + off + 20);
 
         /* 64-bit on purpose: data_len is a u32 straight off the wire, and
            24 + data_len wraps in 32 bits, so a bogus length passes the bounds
@@ -2551,7 +2644,8 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
         if ((uint32_t)subject_len + (uint32_t)reply_len > data_len)
             return ARBITRO_ERR_PROTOCOL;
 
-        if (arb__find_sub(c, consumer_id, &cb, &ud)) {
+        owner = arb__find_sub_by_id(c, sub_id);
+        if (owner >= 0) {
             arbitro_msg_t msg;
             msg.client       = c;
             msg.subject      = body + off + 24;
@@ -2562,9 +2656,9 @@ static int arb__dispatch_batch_body(arbitro_client_t *c,
             msg.data_len     = data_len - (uint32_t)subject_len - (uint32_t)reply_len;
             msg.seq          = seq;
             msg.consumer_id  = consumer_id;
-            msg.subject_hash = subject_hash;
+            msg.sub_id       = sub_id;
             c->m_deliveries_recv++;
-            cb(&msg, ud);
+            arb__fanout(c, owner, &msg);
         }
 
         off = (uint32_t)entry_end;
@@ -3144,7 +3238,7 @@ int arbitro_msg_copy(const arbitro_msg_t *msg, arbitro_msg_owned_t *out) {
     out->data_len     = msg->data_len;
     out->seq          = msg->seq;
     out->consumer_id  = msg->consumer_id;
-    out->subject_hash = msg->subject_hash;
+    out->sub_id = msg->sub_id;
     return ARBITRO_OK;
 }
 
@@ -4447,7 +4541,11 @@ static void arb__resubscribe_all(arbitro_client_t *c) {
             arb__json_key(&j, "consumer_id");
             arb__json_u32(&j, c->subs[i].consumer_id);
             arb__json_key(&j, "subscription_id");
-            arb__json_u32(&j, 0);
+            /* Same id as before the drop: a fresh one would leave the
+               broker's old pendings orphaned until ack_wait expires, and
+               every ack this client sends afterwards names an id the broker
+               no longer has. */
+            arb__json_u32(&j, c->subs[i].sub_id);
             arb__json_key(&j, "filters");
             arb__json_array_begin(&j);
             if (c->subs[i].filter_len > 0)

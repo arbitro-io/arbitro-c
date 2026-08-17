@@ -143,12 +143,19 @@ Uses the **standard 16B header** (not Envelope) — `seq` at header offset
 a fixed 12-byte `DeliverBody`, then the subject, then the payload:
 
 ```
-[0:4]   consumer_id   u32
-[4:8]   subject_hash  u32
-[8:10]  subject_len   u16
-[10:12] pad           u16
+[0:4]   consumer_id     u32
+[4:8]   subscription_id u32
+[8:10]  subject_len     u16
+[10:12] pad             u16
 [12:..]  subject[subject_len] + payload[remainder]
 ```
+
+Offset 4 is the SUBSCRIPTION, not a subject hash. It names which of the
+consumer's subscriptions this copy was delivered for, and it is what an ack
+must echo — the broker opens one pending per subscription, so acking under
+another subscription's id leaves the real one outstanding until ack_wait
+fires. Source of truth: `arbitro-proto/src/v2/egress/deliver_frame.rs`
+(`DeliverBody`).
 
 Single Deliver does not carry a `reply_to` — that field is empty on the
 client-side message view.
@@ -160,10 +167,10 @@ then N entries:
 ```
 [0:4]   consumer_id   u32
 [4:12]  seq           u64
-[12:14] subject_len   u16
-[14:16] reply_len     u16
-[16:20] data_len      u32
-[20:24] subject_hash  u32
+[12:14] subject_len     u16
+[14:16] reply_len       u16
+[16:20] data_len        u32
+[20:24] subscription_id u32
 [24:..]  subject[subject_len] + reply_to[reply_len] + payload[data_len]
 ```
 

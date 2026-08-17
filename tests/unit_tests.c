@@ -166,7 +166,7 @@ ARB_TEST(test_ack_body_layout) {
     uint8_t frame[ARB_HDR_LEN + 16];
     arb__hdr_write(frame, ARB_ACT_NACK, 0, 0, 16, 1);
     arb__put_u32(frame + ARB_HDR_LEN + 0, 5);      /* consumer_id */
-    arb__put_u32(frame + ARB_HDR_LEN + 4, 0xABCD); /* subject_hash */
+    arb__put_u32(frame + ARB_HDR_LEN + 4, 0xABCD); /* sub_id */
     arb__put_u64(frame + ARB_HDR_LEN + 8, 100);    /* seq */
 
     ARB_ASSERT_EQ(arb__get_u32(frame + ARB_HDR_LEN + 0), 5u);
@@ -264,7 +264,7 @@ ARB_TEST(test_repbatch_entry_walk) {
     arb__put_u16(body + off + 12, 1);   /* subject_len */
     arb__put_u16(body + off + 14, 0);   /* reply_len */
     arb__put_u32(body + off + 16, 1);   /* data_len */
-    arb__put_u32(body + off + 20, 0x1111); /* subject_hash */
+    arb__put_u32(body + off + 20, 0x1111); /* sub_id */
     body[off + 24] = 'a';               /* subject */
     body[off + 25] = 'X';               /* data */
     off += 26;

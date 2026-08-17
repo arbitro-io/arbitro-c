@@ -57,7 +57,11 @@ typedef struct arbitro_msg {
     uint32_t          data_len;
     uint64_t          seq;
     uint32_t          consumer_id;
-    uint32_t          subject_hash;
+    /* The subscription this copy was delivered for. Several subscriptions
+       may share a consumer, and the broker opens one pending per
+       subscription, so an ack that carries the wrong id leaves the real one
+       outstanding until ack_wait fires. */
+    uint32_t          sub_id;
 } arbitro_msg_t;
 
 typedef void (*arbitro_msg_cb)(arbitro_msg_t *msg, void *userdata);
@@ -281,7 +285,7 @@ typedef struct {
     uint32_t data_len;
     uint64_t seq;
     uint32_t consumer_id;
-    uint32_t subject_hash;
+    uint32_t sub_id;
 } arbitro_msg_owned_t;
 
 int  arbitro_msg_copy(const arbitro_msg_t *msg, arbitro_msg_owned_t *out);
